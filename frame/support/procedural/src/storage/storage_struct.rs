@@ -157,6 +157,25 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 				let key = &map.key;
 				let storage_name = syn::LitStr::new(&line.name.to_string(), line.name.span());
 				quote!(
+					impl<#impl_trait> #scrate::storage::StoragePrefixedMap for #storage_struct
+					#optional_storage_where_clause
+					{
+						type Value = #value_type;
+						fn prefix() -> Vec<u8> {
+							use #scrate::hash::StorageHasher;
+
+							let module_prefix = #instance_or_inherent::PREFIX.as_bytes();
+							let hashed_module_prefix = #scrate::hash::Twox128::hash(module_prefix);
+							let storage_name = #storage_name.as_bytes();
+							let hashed_storage_name = #scrate::hash::Twox128::hash(storage_name);
+
+							let mut prefix = Vec::with_capacity(32);
+							prefix.extend_from_slice(&hashed_module_prefix[..]);
+							prefix.extend_from_slice(&hashed_storage_name[..]);
+							prefix
+						}
+					}
+
 					impl<#impl_trait> #scrate::#storage_generator_trait for #storage_struct
 					#optional_storage_where_clause
 					{
@@ -175,21 +194,15 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 						fn storage_map_final_key<KeyArg>(key: KeyArg) -> Self::FinalKey
 							where KeyArg: #scrate::codec::EncodeLike<#key>
 						{
+							use #scrate::storage::StoragePrefixedMap;
 							use #scrate::codec::Encode;
 							use #scrate::hash::StorageHasher;
 							use core::borrow::Borrow;
 
-							let module_prefix = #instance_or_inherent::PREFIX.as_bytes();
-							let hashed_module_prefix = #scrate::hash::Twox128::hash(module_prefix);
-							let storage_name = #storage_name.as_bytes();
-							let hashed_storage_name = #scrate::hash::Twox128::hash(storage_name);
-
 							let hashed_key = key.borrow()
 								.using_encoded(#scrate::hash::#hasher::hash);
 
-							let mut final_key = Vec::new();
-							final_key.extend_from_slice(&hashed_module_prefix[..]);
-							final_key.extend_from_slice(&hashed_storage_name[..]);
+							let mut final_key = Self::prefix();
 							final_key.extend_from_slice(&hashed_key[..]);
 							final_key
 						}
