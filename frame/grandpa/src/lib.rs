@@ -1,18 +1,19 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! GRANDPA Consensus module for runtime.
 //!
@@ -28,30 +29,68 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 // re-export since this is necessary for `impl_apis` in runtime.
-pub use substrate_finality_grandpa_primitives as fg_primitives;
+pub use sp_finality_grandpa as fg_primitives;
 
-use rstd::prelude::*;
-use codec::{self as codec, Encode, Decode, Error};
-use support::{decl_event, decl_storage, decl_module, dispatch::Result, storage};
-use sr_primitives::{
-	generic::{DigestItem, OpaqueDigestItemId}, traits::Zero, Perbill,
-};
-use sr_staking_primitives::{
-	SessionIndex,
-	offence::{Offence, Kind},
-};
-use fg_primitives::{
-	GRANDPA_AUTHORITIES_KEY, GRANDPA_ENGINE_ID, ScheduledChange, ConsensusLog, SetId, RoundNumber,
-};
+use sp_std::prelude::*;
+
+use codec::{self as codec, Decode, Encode};
 pub use fg_primitives::{AuthorityId, AuthorityList, AuthorityWeight, VersionedAuthorityList};
-use system::{ensure_signed, DigestOf};
+use fg_primitives::{
+	ConsensusLog, EquivocationProof, ScheduledChange, SetId, GRANDPA_AUTHORITIES_KEY,
+	GRANDPA_ENGINE_ID,
+};
+use frame_support::{
+	decl_error, decl_event, decl_module, decl_storage, storage, traits::KeyOwnerProofSystem,
+	Parameter,
+};
+use frame_system::{self as system, ensure_signed, DigestOf};
+use sp_runtime::{
+	generic::{DigestItem, OpaqueDigestItemId},
+	traits::Zero,
+	DispatchResult, KeyTypeId,
+};
+use sp_staking::SessionIndex;
 
+mod equivocation;
 mod mock;
 mod tests;
 
-pub trait Trait: system::Trait {
+pub use equivocation::{
+	EquivocationHandler, GetSessionNumber, GetValidatorCount, GrandpaEquivocationOffence,
+	GrandpaOffence, GrandpaTimeSlot, HandleEquivocation, ValidateEquivocationReport,
+};
+
+pub trait Trait: frame_system::Trait {
 	/// The event type of this module.
-	type Event: From<Event> + Into<<Self as system::Trait>::Event>;
+	type Event: From<Event> + Into<<Self as frame_system::Trait>::Event>;
+
+	/// The function call.
+	type Call: From<Call<Self>>;
+
+	/// The proof of key ownership, used for validating equivocation reports.
+	/// The proof must include the session index and validator count of the
+	/// session at which the equivocation occurred.
+	type KeyOwnerProof: Parameter + GetSessionNumber + GetValidatorCount;
+
+	/// The identification of a key owner, used when reporting equivocations.
+	type KeyOwnerIdentification: Parameter;
+
+	/// A system for proving ownership of keys, i.e. that a given key was part
+	/// of a validator set, needed for validating equivocation reports.
+	type KeyOwnerProofSystem: KeyOwnerProofSystem<
+		(KeyTypeId, AuthorityId),
+		Proof = Self::KeyOwnerProof,
+		IdentificationTuple = Self::KeyOwnerIdentification,
+	>;
+
+	/// The equivocation handling subsystem, defines methods to report an
+	/// offence (after the equivocation has been validated) and for submitting a
+	/// transaction to report an equivocation (from an offchain context).
+	/// NOTE: when enabling equivocation handling (i.e. this type isn't set to
+	/// `()`) you must add the `equivocation::ValidateEquivocationReport` signed
+	/// extension to the runtime's `SignedExtra` definition, otherwise
+	/// equivocation reports won't be properly validated.
+	type HandleEquivocation: HandleEquivocation<Self>;
 }
 
 /// A stored pending change, old format.
@@ -82,7 +121,7 @@ pub struct StoredPendingChange<N> {
 }
 
 impl<N: Decode> Decode for StoredPendingChange<N> {
-	fn decode<I: codec::Input>(value: &mut I) -> core::result::Result<Self, Error> {
+	fn decode<I: codec::Input>(value: &mut I) -> core::result::Result<Self, codec::Error> {
 		let old = OldStoredPendingChange::decode(value)?;
 		let forced = <Option<N>>::decode(value).unwrap_or(None);
 
@@ -123,7 +162,7 @@ pub enum StoredState<N> {
 	},
 }
 
-decl_event!(
+decl_event! {
 	pub enum Event {
 		/// New authority set has been applied.
 		NewAuthorities(AuthorityList),
@@ -132,17 +171,29 @@ decl_event!(
 		/// Current authority set has been resumed.
 		Resumed,
 	}
-);
+}
+
+decl_error! {
+	pub enum Error for Module<T: Trait> {
+		/// Attempt to signal GRANDPA pause when the authority set isn't live
+		/// (either paused or already pending pause).
+		PauseFailed,
+		/// Attempt to signal GRANDPA resume when the authority set isn't paused
+		/// (either live or already pending resume).
+		ResumeFailed,
+		/// Attempt to signal GRANDPA change with one already pending.
+		ChangePending,
+		/// Cannot signal forced change so soon after last.
+		TooSoon,
+		/// A key ownership proof provided as part of an equivocation report is invalid.
+		InvalidKeyOwnershipProof,
+		/// A given equivocation report is valid but already previously reported.
+		DuplicateOffenceReport,
+	}
+}
 
 decl_storage! {
 	trait Store for Module<T: Trait> as GrandpaFinality {
-		/// DEPRECATED
-		///
-		/// This used to store the current authority set, which has been migrated to the well-known
-		/// GRANDPA_AUTHORITES_KEY unhashed key.
-		#[cfg(feature = "migrate-authorities")]
-		pub(crate) Authorities get(fn authorities): AuthorityList;
-
 		/// State of the current authority set.
 		State get(fn state): StoredState<T::BlockNumber> = StoredState::Live;
 
@@ -159,28 +210,68 @@ decl_storage! {
 		/// in the "set" of Grandpa validators from genesis.
 		CurrentSetId get(fn current_set_id) build(|_| fg_primitives::SetId::default()): SetId;
 
-		/// A mapping from grandpa set ID to the index of the *most recent* session for which its members were responsible.
-		SetIdSession get(fn session_for_set): map SetId => Option<SessionIndex>;
+		/// A mapping from grandpa set ID to the index of the *most recent* session for which its
+		/// members were responsible.
+		SetIdSession get(fn session_for_set): map hasher(twox_64_concat) SetId => Option<SessionIndex>;
 	}
 	add_extra_genesis {
 		config(authorities): AuthorityList;
-		build(|config| Module::<T>::initialize_authorities(&config.authorities))
+		build(|config| {
+			Module::<T>::initialize(&config.authorities)
+		})
 	}
 }
 
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
+		type Error = Error<T>;
+
 		fn deposit_event() = default;
 
-		/// Report some misbehavior.
-		fn report_misbehavior(origin, _report: Vec<u8>) {
-			ensure_signed(origin)?;
-			// FIXME: https://github.com/paritytech/substrate/issues/1112
-		}
+		/// Report voter equivocation/misbehavior. This method will verify the
+		/// equivocation proof and validate the given key ownership proof
+		/// against the extracted offender. If both are valid, the offence
+		/// will be reported.
+		///
+		/// Since the weight of the extrinsic is 0, in order to avoid DoS by
+		/// submission of invalid equivocation reports, a mandatory pre-validation of
+		/// the extrinsic is implemented in a `SignedExtension`.
+		#[weight = 0]
+		fn report_equivocation(
+			origin,
+			equivocation_proof: EquivocationProof<T::Hash, T::BlockNumber>,
+			key_owner_proof: T::KeyOwnerProof,
+		) {
+			let reporter_id = ensure_signed(origin)?;
 
-		fn on_initialize() {
-			#[cfg(feature = "migrate-authorities")]
-			Self::migrate_authorities();
+			let (session_index, validator_set_count) = (
+				key_owner_proof.session(),
+				key_owner_proof.validator_count(),
+			);
+
+			// we have already checked this proof in `SignedExtension`, we to
+			// check it again to get the full identification of the offender.
+			let offender =
+				T::KeyOwnerProofSystem::check_proof(
+					(fg_primitives::KEY_TYPE, equivocation_proof.offender().clone()),
+					key_owner_proof,
+				).ok_or(Error::<T>::InvalidKeyOwnershipProof)?;
+
+			// the set id and round when the offence happened
+			let set_id = equivocation_proof.set_id();
+			let round = equivocation_proof.round();
+
+			// report to the offences module rewarding the sender.
+			T::HandleEquivocation::report_offence(
+				vec![reporter_id],
+				<T::HandleEquivocation as HandleEquivocation<T>>::Offence::new(
+					session_index,
+					validator_set_count,
+					offender,
+					set_id,
+					round,
+				),
+			).map_err(|_| Error::<T>::DuplicateOffenceReport)?;
 		}
 
 		fn on_finalize(block_number: T::BlockNumber) {
@@ -264,9 +355,9 @@ impl<T: Trait> Module<T> {
 
 	/// Schedule GRANDPA to pause starting in the given number of blocks.
 	/// Cannot be done when already paused.
-	pub fn schedule_pause(in_blocks: T::BlockNumber) -> Result {
+	pub fn schedule_pause(in_blocks: T::BlockNumber) -> DispatchResult {
 		if let StoredState::Live = <State<T>>::get() {
-			let scheduled_at = <system::Module<T>>::block_number();
+			let scheduled_at = <frame_system::Module<T>>::block_number();
 			<State<T>>::put(StoredState::PendingPause {
 				delay: in_blocks,
 				scheduled_at,
@@ -274,15 +365,14 @@ impl<T: Trait> Module<T> {
 
 			Ok(())
 		} else {
-			Err("Attempt to signal GRANDPA pause when the authority set isn't live \
-				(either paused or already pending pause).")
+			Err(Error::<T>::PauseFailed)?
 		}
 	}
 
 	/// Schedule a resume of GRANDPA after pausing.
-	pub fn schedule_resume(in_blocks: T::BlockNumber) -> Result {
+	pub fn schedule_resume(in_blocks: T::BlockNumber) -> DispatchResult {
 		if let StoredState::Paused = <State<T>>::get() {
-			let scheduled_at = <system::Module<T>>::block_number();
+			let scheduled_at = <frame_system::Module<T>>::block_number();
 			<State<T>>::put(StoredState::PendingResume {
 				delay: in_blocks,
 				scheduled_at,
@@ -290,8 +380,7 @@ impl<T: Trait> Module<T> {
 
 			Ok(())
 		} else {
-			Err("Attempt to signal GRANDPA resume when the authority set isn't paused \
-				(either live or already pending resume).")
+			Err(Error::<T>::ResumeFailed)?
 		}
 	}
 
@@ -313,13 +402,13 @@ impl<T: Trait> Module<T> {
 		next_authorities: AuthorityList,
 		in_blocks: T::BlockNumber,
 		forced: Option<T::BlockNumber>,
-	) -> Result {
+	) -> DispatchResult {
 		if !<PendingChange<T>>::exists() {
-			let scheduled_at = <system::Module<T>>::block_number();
+			let scheduled_at = <frame_system::Module<T>>::block_number();
 
 			if let Some(_) = forced {
 				if Self::next_forced().map_or(false, |next| next > scheduled_at) {
-					return Err("Cannot signal forced change so soon after last.");
+					Err(Error::<T>::TooSoon)?
 				}
 
 				// only allow the next forced change when twice the window has passed since
@@ -336,17 +425,19 @@ impl<T: Trait> Module<T> {
 
 			Ok(())
 		} else {
-			Err("Attempt to signal GRANDPA change with one already pending.")
+			Err(Error::<T>::ChangePending)?
 		}
 	}
 
 	/// Deposit one of this module's logs.
 	fn deposit_log(log: ConsensusLog<T::BlockNumber>) {
 		let log: DigestItem<T::Hash> = DigestItem::Consensus(GRANDPA_ENGINE_ID, log.encode());
-		<system::Module<T>>::deposit_log(log.into());
+		<frame_system::Module<T>>::deposit_log(log.into());
 	}
 
-	fn initialize_authorities(authorities: &AuthorityList) {
+	// Perform module initialization, abstracted so that it can be called either through genesis
+	// config builder or through `on_genesis_session`.
+	fn initialize(authorities: &AuthorityList) {
 		if !authorities.is_empty() {
 			assert!(
 				Self::grandpa_authorities().is_empty(),
@@ -354,13 +445,22 @@ impl<T: Trait> Module<T> {
 			);
 			Self::set_grandpa_authorities(authorities);
 		}
+
+		// NOTE: initialize first session of first set. this is necessary for
+		// the genesis set and session since we only update the set -> session
+		// mapping whenever a new session starts, i.e. through `on_new_session`.
+		SetIdSession::insert(0, 0);
 	}
 
-	#[cfg(feature = "migrate-authorities")]
-	fn migrate_authorities() {
-		if Authorities::exists() {
-			Self::set_grandpa_authorities(&Authorities::take());
-		}
+	/// Submits an extrinsic to report an equivocation. This method will sign an
+	/// extrinsic with a call to `report_equivocation` with any reporting keys
+	/// available in the keystore and will push the transaction to the pool.
+	/// Only useful in an offchain context.
+	pub fn submit_report_equivocation_extrinsic(
+		equivocation_proof: EquivocationProof<T::Hash, T::BlockNumber>,
+		key_owner_proof: T::KeyOwnerProof,
+	) -> Option<()> {
+		T::HandleEquivocation::submit_equivocation_report(equivocation_proof, key_owner_proof).ok()
 	}
 }
 
@@ -400,12 +500,12 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-impl<T: Trait> sr_primitives::BoundToRuntimeAppPublic for Module<T> {
+impl<T: Trait> sp_runtime::BoundToRuntimeAppPublic for Module<T> {
 	type Public = AuthorityId;
 }
 
-impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T>
-	where T: session::Trait
+impl<T: Trait> pallet_session::OneSessionHandler<T::AccountId> for Module<T>
+	where T: pallet_session::Trait
 {
 	type Key = AuthorityId;
 
@@ -413,14 +513,14 @@ impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T>
 		where I: Iterator<Item=(&'a T::AccountId, AuthorityId)>
 	{
 		let authorities = validators.map(|(_, k)| (k, 1)).collect::<Vec<_>>();
-		Self::initialize_authorities(&authorities);
+		Self::initialize(&authorities);
 	}
 
 	fn on_new_session<'a, I: 'a>(changed: bool, validators: I, _queued_validators: I)
 		where I: Iterator<Item=(&'a T::AccountId, AuthorityId)>
 	{
 		// Always issue a change if `session` says that the validators have changed.
-		// Even if their session keys are the same as before, the underyling economic
+		// Even if their session keys are the same as before, the underlying economic
 		// identities have changed.
 		let current_set_id = if changed {
 			let next_authorities = validators.map(|(_, k)| (k, 1)).collect::<Vec<_>>();
@@ -438,7 +538,7 @@ impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T>
 
 		// if we didn't issue a change, we update the mapping to note that the current
 		// set corresponds to the latest equivalent session (i.e. now).
-		let session_index = <session::Module<T>>::current_index();
+		let session_index = <pallet_session::Module<T>>::current_index();
 		SetIdSession::insert(current_set_id, &session_index);
 	}
 
@@ -447,64 +547,11 @@ impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T>
 	}
 }
 
-impl<T: Trait> finality_tracker::OnFinalizationStalled<T::BlockNumber> for Module<T> {
+impl<T: Trait> pallet_finality_tracker::OnFinalizationStalled<T::BlockNumber> for Module<T> {
 	fn on_stalled(further_wait: T::BlockNumber, median: T::BlockNumber) {
-		// when we record old authority sets, we can use `finality_tracker::median`
+		// when we record old authority sets, we can use `pallet_finality_tracker::median`
 		// to figure out _who_ failed. until then, we can't meaningfully guard
 		// against `next == last` the way that normal session changes do.
 		<Stalled<T>>::put((further_wait, median));
-	}
-}
-
-/// A round number and set id which point on the time of an offence.
-#[derive(Copy, Clone, PartialOrd, Ord, Eq, PartialEq, Encode, Decode)]
-struct GrandpaTimeSlot {
-	// The order of these matters for `derive(Ord)`.
-	set_id: SetId,
-	round: RoundNumber,
-}
-
-// TODO [slashing]: Integrate this.
-/// A grandpa equivocation offence report.
-#[allow(dead_code)]
-struct GrandpaEquivocationOffence<FullIdentification> {
-	/// Time slot at which this incident happened.
-	time_slot: GrandpaTimeSlot,
-	/// The session index in which the incident happened.
-	session_index: SessionIndex,
-	/// The size of the validator set at the time of the offence.
-	validator_set_count: u32,
-	/// The authority which produced this equivocation.
-	offender: FullIdentification,
-}
-
-impl<FullIdentification: Clone> Offence<FullIdentification> for GrandpaEquivocationOffence<FullIdentification> {
-	const ID: Kind = *b"grandpa:equivoca";
-	type TimeSlot = GrandpaTimeSlot;
-
-	fn offenders(&self) -> Vec<FullIdentification> {
-		vec![self.offender.clone()]
-	}
-
-	fn session_index(&self) -> SessionIndex {
-		self.session_index
-	}
-
-	fn validator_set_count(&self) -> u32 {
-		self.validator_set_count
-	}
-
-	fn time_slot(&self) -> Self::TimeSlot {
-		self.time_slot
-	}
-
-	fn slash_fraction(
-		offenders_count: u32,
-		validator_set_count: u32,
-	) -> Perbill {
-		// the formula is min((3k / n)^2, 1)
-		let x = Perbill::from_rational_approximation(3 * offenders_count, validator_set_count);
-		// _ ^ 2
-		x.square()
 	}
 }

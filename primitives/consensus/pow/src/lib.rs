@@ -1,25 +1,26 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Primitives for Substrate Proof-of-Work (PoW) consensus.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use rstd::vec::Vec;
-use sr_primitives::ConsensusEngineId;
+use sp_std::vec::Vec;
+use sp_runtime::ConsensusEngineId;
 use codec::Decode;
 
 /// The `ConsensusEngineId` of PoW.
@@ -33,7 +34,7 @@ pub trait TotalDifficulty {
 	fn increment(&mut self, other: Self);
 }
 
-impl TotalDifficulty for primitives::U256 {
+impl TotalDifficulty for sp_core::U256 {
 	fn increment(&mut self, other: Self) {
 		let ret = self.saturating_add(other);
 		*self = ret;
@@ -47,7 +48,7 @@ impl TotalDifficulty for u128 {
 	}
 }
 
-sr_api::decl_runtime_apis! {
+sp_api::decl_runtime_apis! {
 	/// API necessary for timestamp-based difficulty adjustment algorithms.
 	pub trait TimestampApi<Moment: Decode> {
 		/// Return the timestamp in the current block.

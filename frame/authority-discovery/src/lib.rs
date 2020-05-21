@@ -1,33 +1,34 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! # Authority discovery module.
 //!
-//! This module is used by the `core/authority-discovery` to retrieve the
+//! This module is used by the `client/authority-discovery` to retrieve the
 //! current set of authorities.
 
 // Ensure we're `no_std` when compiling for Wasm.
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use rstd::prelude::*;
-use support::{decl_module, decl_storage};
-use authority_discovery_primitives::AuthorityId;
+use sp_std::prelude::*;
+use frame_support::{decl_module, decl_storage};
+use sp_authority_discovery::AuthorityId;
 
 /// The module's config trait.
-pub trait Trait: system::Trait + session::Trait {}
+pub trait Trait: frame_system::Trait + pallet_session::Trait {}
 
 decl_storage! {
 	trait Store for Module<T: Trait> as AuthorityDiscovery {
@@ -59,11 +60,11 @@ impl<T: Trait> Module<T> {
 	}
 }
 
-impl<T: Trait> sr_primitives::BoundToRuntimeAppPublic for Module<T> {
+impl<T: Trait> sp_runtime::BoundToRuntimeAppPublic for Module<T> {
 	type Public = AuthorityId;
 }
 
-impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T> {
+impl<T: Trait> pallet_session::OneSessionHandler<T::AccountId> for Module<T> {
 	type Key = AuthorityId;
 
 	fn on_genesis_session<'a, I: 'a>(authorities: I)
@@ -92,47 +93,39 @@ impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use authority_discovery_primitives::{AuthorityPair};
-	use app_crypto::Pair;
-	use primitives::{crypto::key_types, H256};
-	use runtime_io::TestExternalities;
-	use sr_primitives::{
+	use sp_authority_discovery::{AuthorityPair};
+	use sp_application_crypto::Pair;
+	use sp_core::{crypto::key_types, H256};
+	use sp_io::TestExternalities;
+	use sp_runtime::{
 		testing::{Header, UintAuthorityId}, traits::{ConvertInto, IdentityLookup, OpaqueKeys},
 		Perbill, KeyTypeId,
 	};
-	use support::{impl_outer_origin, parameter_types};
+	use frame_support::{impl_outer_origin, parameter_types, weights::Weight};
 
 	type AuthorityDiscovery = Module<Test>;
-	type SessionIndex = u32;
 
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
 	impl Trait for Test {}
 
-	pub struct TestOnSessionEnding;
-	impl session::OnSessionEnding<AuthorityId> for TestOnSessionEnding {
-		fn on_session_ending(_: SessionIndex, _: SessionIndex) -> Option<Vec<AuthorityId>> {
-			None
-		}
-	}
-
 	parameter_types! {
 		pub const DisabledValidatorsThreshold: Perbill = Perbill::from_percent(33);
 	}
 
-	impl session::Trait for Test {
-		type OnSessionEnding = TestOnSessionEnding;
+	impl pallet_session::Trait for Test {
+		type SessionManager = ();
 		type Keys = UintAuthorityId;
-		type ShouldEndSession = session::PeriodicSessions<Period, Offset>;
+		type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
 		type SessionHandler = TestSessionHandler;
 		type Event = ();
 		type ValidatorId = AuthorityId;
 		type ValidatorIdOf = ConvertInto;
-		type SelectInitialValidators = ();
 		type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
+		type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
 	}
 
-	impl session::historical::Trait for Test {
+	impl pallet_session::historical::Trait for Test {
 		type FullIdentification = ();
 		type FullIdentificationOf = ();
 	}
@@ -144,35 +137,43 @@ mod tests {
 		pub const Offset: BlockNumber = 0;
 		pub const UncleGenerations: u64 = 0;
 		pub const BlockHashCount: u64 = 250;
-		pub const MaximumBlockWeight: u32 = 1024;
+		pub const MaximumBlockWeight: Weight = 1024;
 		pub const MaximumBlockLength: u32 = 2 * 1024;
 		pub const AvailableBlockRatio: Perbill = Perbill::one();
 	}
 
-	impl system::Trait for Test {
+	impl frame_system::Trait for Test {
 		type Origin = Origin;
 		type Index = u64;
 		type BlockNumber = BlockNumber;
 		type Call = ();
 		type Hash = H256;
-		type Hashing = ::sr_primitives::traits::BlakeTwo256;
+		type Hashing = ::sp_runtime::traits::BlakeTwo256;
 		type AccountId = AuthorityId;
 		type Lookup = IdentityLookup<Self::AccountId>;
 		type Header = Header;
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
 		type MaximumBlockWeight = MaximumBlockWeight;
+		type DbWeight = ();
+		type BlockExecutionWeight = ();
+		type ExtrinsicBaseWeight = ();
+		type MaximumExtrinsicWeight = MaximumBlockWeight;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
+		type ModuleToIndex = ();
+		type AccountData = ();
+		type OnNewAccount = ();
+		type OnKilledAccount = ();
 	}
 
 	impl_outer_origin! {
-		pub enum Origin for Test {}
+		pub enum Origin for Test  where system = frame_system {}
 	}
 
 	pub struct TestSessionHandler;
-	impl session::SessionHandler<AuthorityId> for TestSessionHandler {
+	impl pallet_session::SessionHandler<AuthorityId> for TestSessionHandler {
 		const KEY_TYPE_IDS: &'static [KeyTypeId] = &[key_types::DUMMY];
 
 		fn on_new_session<Ks: OpaqueKeys>(
@@ -190,7 +191,7 @@ mod tests {
 	#[test]
 	fn authorities_returns_current_authority_set() {
 		// The whole authority discovery module ignores account ids, but we still need it for
-		// `session::OneSessionHandler::on_new_session`, thus its safe to use the same value everywhere.
+		// `pallet_session::OneSessionHandler::on_new_session`, thus its safe to use the same value everywhere.
 		let account_id = AuthorityPair::from_seed_slice(vec![10; 32].as_ref()).unwrap().public();
 
 		let first_authorities: Vec<AuthorityId> = vec![0, 1].into_iter()
@@ -203,14 +204,14 @@ mod tests {
 			.map(AuthorityId::from)
 			.collect();
 
-		// Needed for `session::OneSessionHandler::on_new_session`.
+		// Needed for `pallet_session::OneSessionHandler::on_new_session`.
 		let second_authorities_and_account_ids: Vec<(&AuthorityId, AuthorityId)> = second_authorities.clone()
 			.into_iter()
 			.map(|id| (&account_id, id))
 			.collect();
 
 		// Build genesis.
-		let mut t = system::GenesisConfig::default()
+		let mut t = frame_system::GenesisConfig::default()
 			.build_storage::<Test>()
 			.unwrap();
 
@@ -224,7 +225,7 @@ mod tests {
 		let mut externalities = TestExternalities::new(t);
 
 		externalities.execute_with(|| {
-			use session::OneSessionHandler;
+			use pallet_session::OneSessionHandler;
 
 			AuthorityDiscovery::on_genesis_session(
 				first_authorities.iter().map(|id| (id, id.clone()))

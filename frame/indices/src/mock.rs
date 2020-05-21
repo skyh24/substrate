@@ -1,112 +1,111 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Test utilities
 
 #![cfg(test)]
 
-use std::collections::HashSet;
-use ref_thread_local::{ref_thread_local, RefThreadLocal};
-use sr_primitives::testing::Header;
-use sr_primitives::Perbill;
-use primitives::H256;
-use support::{impl_outer_origin, parameter_types};
-use {runtime_io, system};
-use crate::{GenesisConfig, Module, Trait, IsDeadAccount, OnNewAccount, ResolveHint};
+use sp_runtime::testing::Header;
+use sp_runtime::Perbill;
+use sp_core::H256;
+use frame_support::{impl_outer_origin, impl_outer_event, parameter_types, weights::Weight};
+use crate::{self as indices, Module, Trait};
+use frame_system as system;
+use pallet_balances as balances;
 
 impl_outer_origin!{
-	pub enum Origin for Runtime {}
+	pub enum Origin for Test where system = frame_system {}
 }
-
-ref_thread_local! {
-	static managed ALIVE: HashSet<u64> = HashSet::new();
-}
-
-pub fn make_account(who: u64) {
-	ALIVE.borrow_mut().insert(who);
-	Indices::on_new_account(&who);
-}
-
-pub fn kill_account(who: u64) {
-	ALIVE.borrow_mut().remove(&who);
-}
-
-pub struct TestIsDeadAccount {}
-impl IsDeadAccount<u64> for TestIsDeadAccount {
-	fn is_dead_account(who: &u64) -> bool {
-		!ALIVE.borrow_mut().contains(who)
-	}
-}
-
-pub struct TestResolveHint;
-impl ResolveHint<u64, u64> for TestResolveHint {
-	fn resolve_hint(who: &u64) -> Option<u64> {
-		if *who < 256 {
-			None
-		} else {
-			Some(*who - 256)
-		}
+impl_outer_event!{
+	pub enum MetaEvent for Test {
+		system<T>,
+		balances<T>,
+		indices<T>,
 	}
 }
 
 // Workaround for https://github.com/rust-lang/rust/issues/26925 . Remove when sorted.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Runtime;
+pub struct Test;
+
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: u32 = 1024;
+	pub const MaximumBlockWeight: Weight = 1024;
 	pub const MaximumBlockLength: u32 = 2 * 1024;
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
-impl system::Trait for Runtime {
+
+impl frame_system::Trait for Test {
 	type Origin = Origin;
+	type Call = ();
 	type Index = u64;
 	type BlockNumber = u64;
-	type Call = ();
 	type Hash = H256;
-	type Hashing = ::sr_primitives::traits::BlakeTwo256;
+	type Hashing = ::sp_runtime::traits::BlakeTwo256;
 	type AccountId = u64;
 	type Lookup = Indices;
 	type Header = Header;
-	type Event = ();
+	type Event = MetaEvent;
 	type BlockHashCount = BlockHashCount;
 	type MaximumBlockWeight = MaximumBlockWeight;
+	type DbWeight = ();
+	type BlockExecutionWeight = ();
+	type ExtrinsicBaseWeight = ();
+	type MaximumExtrinsicWeight = MaximumBlockWeight;
 	type MaximumBlockLength = MaximumBlockLength;
 	type AvailableBlockRatio = AvailableBlockRatio;
 	type Version = ();
+	type ModuleToIndex = ();
+	type AccountData = pallet_balances::AccountData<u64>;
+	type OnNewAccount = ();
+	type OnKilledAccount = ();
 }
-impl Trait for Runtime {
+
+parameter_types! {
+	pub const ExistentialDeposit: u64 = 1;
+}
+
+impl pallet_balances::Trait for Test {
+	type Balance = u64;
+	type DustRemoval = ();
+	type Event = MetaEvent;
+	type ExistentialDeposit = ExistentialDeposit;
+	type AccountStore = System;
+}
+
+parameter_types! {
+	pub const Deposit: u64 = 1;
+}
+
+impl Trait for Test {
 	type AccountIndex = u64;
-	type IsDeadAccount = TestIsDeadAccount;
-	type ResolveHint = TestResolveHint;
-	type Event = ();
+	type Currency = Balances;
+	type Deposit = Deposit;
+	type Event = MetaEvent;
 }
 
-pub fn new_test_ext() -> runtime_io::TestExternalities {
-	{
-		let mut h = ALIVE.borrow_mut();
-		h.clear();
-		for i in 1..5 { h.insert(i); }
-	}
-
-	let mut t = system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
-	GenesisConfig::<Runtime> {
-		ids: vec![1, 2, 3, 4]
+pub fn new_test_ext() -> sp_io::TestExternalities {
+	let mut t = frame_system::GenesisConfig::default().build_storage::<Test>().unwrap();
+	pallet_balances::GenesisConfig::<Test>{
+		balances: vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)],
 	}.assimilate_storage(&mut t).unwrap();
 	t.into()
 }
 
-pub type Indices = Module<Runtime>;
+pub type System = frame_system::Module<Test>;
+pub type Balances = pallet_balances::Module<Test>;
+pub type Indices = Module<Test>;

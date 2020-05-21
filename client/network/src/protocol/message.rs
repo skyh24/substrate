@@ -1,32 +1,34 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Network packet message types. These get serialized and put into the lower level protocol payload.
 
 use bitflags::bitflags;
-use sr_primitives::{ConsensusEngineId, traits::{Block as BlockT, Header as HeaderT}};
+use sp_runtime::{ConsensusEngineId, traits::{Block as BlockT, Header as HeaderT}};
 use codec::{Encode, Decode, Input, Output, Error};
 pub use self::generic::{
 	BlockAnnounce, RemoteCallRequest, RemoteReadRequest,
 	RemoteHeaderRequest, RemoteHeaderResponse,
 	RemoteChangesRequest, RemoteChangesResponse,
 	FinalityProofRequest, FinalityProofResponse,
-	FromBlock, RemoteReadChildRequest,
+	FromBlock, RemoteReadChildRequest, Roles,
 };
-use client_api::StorageProof;
+use sc_client_api::StorageProof;
 
 /// A unique ID of a request.
 pub type RequestId = u64;
@@ -137,14 +139,71 @@ pub struct RemoteReadResponse {
 
 /// Generic types.
 pub mod generic {
+	use bitflags::bitflags;
 	use codec::{Encode, Decode, Input, Output};
-	use sr_primitives::Justification;
-	use crate::config::Roles;
+	use sp_runtime::Justification;
 	use super::{
 		RemoteReadResponse, Transactions, Direction,
 		RequestId, BlockAttributes, RemoteCallResponse, ConsensusEngineId,
 		BlockState, StorageProof,
 	};
+
+	bitflags! {
+		/// Bitmask of the roles that a node fulfills.
+		pub struct Roles: u8 {
+			/// No network.
+			const NONE = 0b00000000;
+			/// Full node, does not participate in consensus.
+			const FULL = 0b00000001;
+			/// Light client node.
+			const LIGHT = 0b00000010;
+			/// Act as an authority
+			const AUTHORITY = 0b00000100;
+		}
+	}
+
+	impl Roles {
+		/// Does this role represents a client that holds full chain data locally?
+		pub fn is_full(&self) -> bool {
+			self.intersects(Roles::FULL | Roles::AUTHORITY)
+		}
+
+		/// Does this role represents a client that does not participates in the consensus?
+		pub fn is_authority(&self) -> bool {
+			*self == Roles::AUTHORITY
+		}
+
+		/// Does this role represents a client that does not hold full chain data locally?
+		pub fn is_light(&self) -> bool {
+			!self.is_full()
+		}
+	}
+
+	impl<'a> From<&'a crate::config::Role> for Roles {
+		fn from(roles: &'a crate::config::Role) -> Self {
+			match roles {
+				crate::config::Role::Full => Roles::FULL,
+				crate::config::Role::Light => Roles::LIGHT,
+				crate::config::Role::Sentry { .. } => Roles::AUTHORITY,
+				crate::config::Role::Authority { .. } => Roles::AUTHORITY,
+			}
+		}
+	}
+
+	impl codec::Encode for Roles {
+		fn encode_to<T: codec::Output>(&self, dest: &mut T) {
+			dest.push_byte(self.bits())
+		}
+	}
+
+	impl codec::EncodeLike for Roles {}
+
+	impl codec::Decode for Roles {
+		fn decode<I: codec::Input>(input: &mut I) -> Result<Self, codec::Error> {
+			Self::from_bits(input.read_byte()?).ok_or_else(|| codec::Error::from("Invalid bytes"))
+		}
+	}
+
 	/// Consensus is mostly opaque to us
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
 	pub struct ConsensusMessage {
@@ -209,19 +268,16 @@ pub mod generic {
 		RemoteHeaderResponse(RemoteHeaderResponse<Header>),
 		/// Remote changes request.
 		RemoteChangesRequest(RemoteChangesRequest<Hash>),
-		/// Remote changes reponse.
+		/// Remote changes response.
 		RemoteChangesResponse(RemoteChangesResponse<Number, Hash>),
 		/// Remote child storage read request.
 		RemoteReadChildRequest(RemoteReadChildRequest<Hash>),
 		/// Finality proof request.
 		FinalityProofRequest(FinalityProofRequest<Hash>),
-		/// Finality proof reponse.
+		/// Finality proof response.
 		FinalityProofResponse(FinalityProofResponse<Hash>),
 		/// Batch of consensus protocol messages.
 		ConsensusBatch(Vec<ConsensusMessage>),
-		/// Chain-specific message.
-		#[codec(index = "255")]
-		ChainSpecific(Vec<u8>),
 	}
 
 	impl<Header, Hash, Number, Extrinsic> Message<Header, Hash, Number, Extrinsic> {
@@ -246,13 +302,34 @@ pub mod generic {
 				Message::FinalityProofRequest(_) => "FinalityProofRequest",
 				Message::FinalityProofResponse(_) => "FinalityProofResponse",
 				Message::ConsensusBatch(_) => "ConsensusBatch",
-				Message::ChainSpecific(_) => "ChainSpecific",
 			}
 		}
 	}
 
 	/// Status sent on connection.
+	// TODO https://github.com/paritytech/substrate/issues/4674: replace the `Status`
+	// struct with this one, after waiting a few releases beyond `NetworkSpecialization`'s
+	// removal (https://github.com/paritytech/substrate/pull/4665)
+	//
+	// and set MIN_VERSION to 6.
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]
+	pub struct CompactStatus<Hash, Number> {
+		/// Protocol version.
+		pub version: u32,
+		/// Minimum supported version.
+		pub min_supported_version: u32,
+		/// Supported roles.
+		pub roles: Roles,
+		/// Best block number.
+		pub best_number: Number,
+		/// Best block hash.
+		pub best_hash: Hash,
+		/// Genesis block hash.
+		pub genesis_hash: Hash,
+	}
+
+	/// Status sent on connection.
+	#[derive(Debug, PartialEq, Eq, Clone, Encode)]
 	pub struct Status<Hash, Number> {
 		/// Protocol version.
 		pub version: u32,
@@ -266,8 +343,42 @@ pub mod generic {
 		pub best_hash: Hash,
 		/// Genesis block hash.
 		pub genesis_hash: Hash,
-		/// Chain-specific status.
+		/// DEPRECATED. Chain-specific status.
 		pub chain_status: Vec<u8>,
+	}
+
+	impl<Hash: Decode, Number: Decode> Decode for Status<Hash, Number> {
+		fn decode<I: Input>(value: &mut I) -> Result<Self, codec::Error> {
+			const LAST_CHAIN_STATUS_VERSION: u32 = 5;
+			let compact = CompactStatus::decode(value)?;
+			let chain_status = match <Vec<u8>>::decode(value) {
+				Ok(v) => v,
+				Err(e) => if compact.version <= LAST_CHAIN_STATUS_VERSION {
+					return Err(e)
+				} else {
+					Vec::new()
+				}
+			};
+
+			let CompactStatus {
+				version,
+				min_supported_version,
+				roles,
+				best_number,
+				best_hash,
+				genesis_hash,
+			} = compact;
+
+			Ok(Status {
+				version,
+				min_supported_version,
+				roles,
+				best_number,
+				best_hash,
+				genesis_hash,
+				chain_status,
+			})
+		}
 	}
 
 	/// Request block data from a peer.

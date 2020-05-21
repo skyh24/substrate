@@ -1,23 +1,25 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Contains the `Node` struct, which handles communications with a single telemetry endpoint.
 
 use bytes::BytesMut;
-use futures::{prelude::*, compat::{Future01CompatExt as _, Compat01As03}};
+use futures::prelude::*;
 use futures_timer::Delay;
 use libp2p::Multiaddr;
 use libp2p::core::transport::Transport;
@@ -42,7 +44,7 @@ enum NodeSocket<TTrans: Transport> {
 	/// We're connected to the node. This is the normal state.
 	Connected(NodeSocketConnected<TTrans>),
 	/// We are currently dialing the node.
-	Dialing(Compat01As03<TTrans::Dial>),
+	Dialing(TTrans::Dial),
 	/// A new connection should be started as soon as possible.
 	ReconnectNow,
 	/// Waiting before attempting to dial again.
@@ -76,6 +78,9 @@ pub enum NodeEvent<TSinkErr> {
 pub enum ConnectionError<TSinkErr> {
 	/// The connection timed-out.
 	Timeout,
+	/// Reading from the socket returned and end-of-file, indicating that the socket has been
+	/// closed.
+	Closed,
 	/// The sink errored.
 	Sink(TSinkErr),
 }
@@ -106,14 +111,14 @@ where TTrans: Clone + Unpin, TTrans::Dial: Unpin,
 	/// Sends a WebSocket frame to the node. Returns an error if we are not connected to the node.
 	///
 	/// After calling this method, you should call `poll` in order for it to be properly processed.
-	pub fn send_message(&mut self, payload: Vec<u8>) -> Result<(), ()> {
+	pub fn send_message(&mut self, payload: impl Into<BytesMut>) -> Result<(), ()> {
 		if let NodeSocket::Connected(NodeSocketConnected { pending, .. }) = &mut self.socket {
 			if pending.len() <= MAX_PENDING {
 				trace!(target: "telemetry", "Adding log entry to queue for {:?}", self.addr);
 				pending.push_back(payload.into());
 				Ok(())
 			} else {
-				warn!(target: "telemetry", "Rejected log entry because queue is full for {:?}",
+				warn!(target: "telemetry", "⚠️  Rejected log entry because queue is full for {:?}",
 					self.addr);
 				Err(())
 			}
@@ -134,7 +139,7 @@ where TTrans: Clone + Unpin, TTrans::Dial: Unpin,
 							break NodeSocket::Connected(conn)
 						},
 						Poll::Ready(Err(err)) => {
-							warn!(target: "telemetry", "Disconnected from {}: {:?}", self.addr, err);
+							warn!(target: "telemetry", "⚠️  Disconnected from {}: {:?}", self.addr, err);
 							let timeout = gen_rand_reconnect_delay();
 							self.socket = NodeSocket::WaitingReconnect(timeout);
 							return Poll::Ready(NodeEvent::Disconnected(err))
@@ -143,7 +148,7 @@ where TTrans: Clone + Unpin, TTrans::Dial: Unpin,
 				}
 				NodeSocket::Dialing(mut s) => match Future::poll(Pin::new(&mut s), cx) {
 					Poll::Ready(Ok(sink)) => {
-						debug!(target: "telemetry", "Connected to {}", self.addr);
+						debug!(target: "telemetry", "✅ Connected to {}", self.addr);
 						let conn = NodeSocketConnected {
 							sink,
 							pending: VecDeque::new(),
@@ -155,7 +160,7 @@ where TTrans: Clone + Unpin, TTrans::Dial: Unpin,
 					},
 					Poll::Pending => break NodeSocket::Dialing(s),
 					Poll::Ready(Err(err)) => {
-						warn!(target: "telemetry", "Error while dialing {}: {:?}", self.addr, err);
+						warn!(target: "telemetry", "❌ Error while dialing {}: {:?}", self.addr, err);
 						let timeout = gen_rand_reconnect_delay();
 						socket = NodeSocket::WaitingReconnect(timeout);
 					}
@@ -163,10 +168,10 @@ where TTrans: Clone + Unpin, TTrans::Dial: Unpin,
 				NodeSocket::ReconnectNow => match self.transport.clone().dial(self.addr.clone()) {
 					Ok(d) => {
 						debug!(target: "telemetry", "Started dialing {}", self.addr);
-						socket = NodeSocket::Dialing(d.compat());
+						socket = NodeSocket::Dialing(d);
 					}
 					Err(err) => {
-						warn!(target: "telemetry", "Error while dialing {}: {:?}", self.addr, err);
+						warn!(target: "telemetry", "❌ Error while dialing {}: {:?}", self.addr, err);
 						let timeout = gen_rand_reconnect_delay();
 						socket = NodeSocket::WaitingReconnect(timeout);
 					}
@@ -178,7 +183,7 @@ where TTrans: Clone + Unpin, TTrans::Dial: Unpin,
 						break NodeSocket::WaitingReconnect(s)
 					}
 				NodeSocket::Poisoned => {
-					error!(target: "telemetry", "Poisoned connection with {}", self.addr);
+					error!(target: "telemetry", "‼️ Poisoned connection with {}", self.addr);
 					break NodeSocket::Poisoned
 				}
 			}
@@ -212,10 +217,13 @@ where TTrans::Output: Sink<BytesMut, Error = TSinkErr>
 	) -> Poll<Result<futures::never::Never, ConnectionError<TSinkErr>>> {
 
 		while let Some(item) = self.pending.pop_front() {
-			if let Poll::Ready(_) = Sink::poll_ready(Pin::new(&mut self.sink), cx) {
+			if let Poll::Ready(result) = Sink::poll_ready(Pin::new(&mut self.sink), cx) {
+				if let Err(err) = result {
+					return Poll::Ready(Err(ConnectionError::Sink(err)))
+				}
+
 				let item_len = item.len();
 				if let Err(err) = Sink::start_send(Pin::new(&mut self.sink), item) {
-					self.timeout = None;
 					return Poll::Ready(Err(ConnectionError::Sink(err)))
 				}
 				trace!(
@@ -270,7 +278,10 @@ where TTrans::Output: Sink<BytesMut, Error = TSinkErr>
 			Poll::Ready(Some(Err(err))) => {
 				return Poll::Ready(Err(ConnectionError::Sink(err)))
 			},
-			Poll::Pending | Poll::Ready(None) => {},
+			Poll::Ready(None) => {
+				return Poll::Ready(Err(ConnectionError::Closed))
+			},
+			Poll::Pending => {},
 		}
 
 		Poll::Pending

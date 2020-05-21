@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -20,9 +20,13 @@
 pub mod backend;
 pub mod call_executor;
 pub mod client;
+pub mod cht;
 pub mod execution_extensions;
+pub mod in_mem;
 pub mod light;
+pub mod leaves;
 pub mod notifications;
+pub mod proof_provider;
 
 pub use sp_blockchain as blockchain;
 pub use backend::*;
@@ -31,15 +35,21 @@ pub use call_executor::*;
 pub use client::*;
 pub use light::*;
 pub use notifications::*;
+pub use proof_provider::*;
 
-pub use state_machine::{StorageProof, ExecutionStrategy};
+pub use sp_state_machine::{StorageProof, ExecutionStrategy, CloneableSpawn};
 
+/// Usage Information Provider interface
+///
+pub trait UsageProvider<Block: sp_runtime::traits::Block> {
+	/// Get usage info about current client.
+	fn usage_info(&self) -> ClientInfo<Block>;
+}
 
 /// Utility methods for the client.
 pub mod utils {
-    use sp_blockchain::{HeaderBackend, HeaderMetadata, Error};
-    use primitives::H256;
-	use sr_primitives::traits::{Block as BlockT};
+	use sp_blockchain::{HeaderBackend, HeaderMetadata, Error};
+	use sp_runtime::traits::Block as BlockT;
 	use std::borrow::Borrow;
 
 	/// Returns a function for checking block ancestry, the returned function will
@@ -48,11 +58,11 @@ pub mod utils {
 	/// represent the current block `hash` and its `parent hash`, if given the
 	/// function that's returned will assume that `hash` isn't part of the local DB
 	/// yet, and all searches in the DB will instead reference the parent.
-	pub fn is_descendent_of<'a, Block: BlockT<Hash=H256>, T, H: Borrow<H256> + 'a>(
+	pub fn is_descendent_of<'a, Block: BlockT, T>(
 		client: &'a T,
-		current: Option<(H, H)>,
-	) -> impl Fn(&H256, &H256) -> Result<bool, Error> + 'a
-		where T: HeaderBackend<Block> + HeaderMetadata<Block, Error=Error>,
+		current: Option<(Block::Hash, Block::Hash)>,
+	) -> impl Fn(&Block::Hash, &Block::Hash) -> Result<bool, Error> + 'a
+		where T: HeaderBackend<Block> + HeaderMetadata<Block, Error = Error>,
 	{
 		move |base, hash| {
 			if base == hash { return Ok(false); }

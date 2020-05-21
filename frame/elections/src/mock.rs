@@ -1,30 +1,32 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Mock file for election module.
 
 #![cfg(test)]
 
 use std::cell::RefCell;
-use support::{
+use frame_support::{
 	StorageValue, StorageMap, parameter_types, assert_ok,
-	traits::{Get, ChangeMembers, Currency}
+	traits::{Get, ChangeMembers, Currency, LockIdentifier},
+	weights::Weight,
 };
-use primitives::H256;
-use sr_primitives::{
+use sp_core::H256;
+use sp_runtime::{
 	Perbill, BuildStorage, testing::Header, traits::{BlakeTwo256, IdentityLookup, Block as BlockT},
 };
 use crate as elections;
@@ -32,15 +34,15 @@ use crate as elections;
 
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: u32 = 1024;
+	pub const MaximumBlockWeight: Weight = 1024;
 	pub const MaximumBlockLength: u32 = 2 * 1024;
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
-impl system::Trait for Test {
+impl frame_system::Trait for Test {
 	type Origin = Origin;
+	type Call = ();
 	type Index = u64;
 	type BlockNumber = u64;
-	type Call = ();
 	type Hash = H256;
 	type Hashing = BlakeTwo256;
 	type AccountId = u64;
@@ -49,26 +51,28 @@ impl system::Trait for Test {
 	type Event = Event;
 	type BlockHashCount = BlockHashCount;
 	type MaximumBlockWeight = MaximumBlockWeight;
+	type DbWeight = ();
+	type BlockExecutionWeight = ();
+	type ExtrinsicBaseWeight = ();
+	type MaximumExtrinsicWeight = MaximumBlockWeight;
 	type MaximumBlockLength = MaximumBlockLength;
 	type AvailableBlockRatio = AvailableBlockRatio;
 	type Version = ();
+	type ModuleToIndex = ();
+	type AccountData = pallet_balances::AccountData<u64>;
+	type OnNewAccount = ();
+	type OnKilledAccount = ();
 }
 
 parameter_types! {
-	pub const ExistentialDeposit: u64 = 0;
-	pub const TransferFee: u64 = 0;
-	pub const CreationFee: u64 = 0;
+	pub const ExistentialDeposit: u64 = 1;
 }
-impl balances::Trait for Test {
+impl pallet_balances::Trait for Test {
 	type Balance = u64;
-	type OnNewAccount = ();
-	type OnFreeBalanceZero = ();
-	type Event = Event;
-	type TransferPayment = ();
 	type DustRemoval = ();
+	type Event = Event;
 	type ExistentialDeposit = ExistentialDeposit;
-	type TransferFee = TransferFee;
-	type CreationFee = CreationFee;
+	type AccountStore = System;
 }
 
 parameter_types! {
@@ -122,6 +126,10 @@ impl ChangeMembers<u64> for TestChangeMembers {
 	}
 }
 
+parameter_types!{
+	pub const ElectionModuleId: LockIdentifier = *b"py/elect"; 
+}
+
 impl elections::Trait for Test {
 	type Event = Event;
 	type Currency = Balances;
@@ -139,19 +147,21 @@ impl elections::Trait for Test {
 	type InactiveGracePeriod = InactiveGracePeriod;
 	type VotingPeriod = VotingPeriod;
 	type DecayRatio = DecayRatio;
+	type ModuleId = ElectionModuleId;
 }
 
-pub type Block = sr_primitives::generic::Block<Header, UncheckedExtrinsic>;
-pub type UncheckedExtrinsic = sr_primitives::generic::UncheckedExtrinsic<u32, u64, Call, ()>;
+pub type Block = sp_runtime::generic::Block<Header, UncheckedExtrinsic>;
+pub type UncheckedExtrinsic = sp_runtime::generic::UncheckedExtrinsic<u32, u64, Call, ()>;
 
-support::construct_runtime!(
+use frame_system as system;
+frame_support::construct_runtime!(
 	pub enum Test where
 		Block = Block,
 		NodeBlock = Block,
 		UncheckedExtrinsic = UncheckedExtrinsic
 	{
-		System: system::{Module, Call, Event},
-		Balances: balances::{Module, Call, Event<T>, Config<T>, Error},
+		System: system::{Module, Call, Event<T>},
+		Balances: pallet_balances::{Module, Call, Event<T>, Config<T>},
 		Elections: elections::{Module, Call, Event<T>, Config<T>},
 	}
 );
@@ -203,13 +213,13 @@ impl ExtBuilder {
 		self.desired_seats = seats;
 		self
 	}
-	pub fn build(self) -> runtime_io::TestExternalities {
+	pub fn build(self) -> sp_io::TestExternalities {
 		VOTER_BOND.with(|v| *v.borrow_mut() = self.voter_bond);
 		VOTING_FEE.with(|v| *v.borrow_mut() = self.voting_fee);
 		PRESENT_SLASH_PER_VOTER.with(|v| *v.borrow_mut() = self.bad_presentation_punishment);
 		DECAY_RATIO.with(|v| *v.borrow_mut() = self.decay_ratio);
-		GenesisConfig {
-			balances: Some(balances::GenesisConfig::<Test>{
+		let mut ext: sp_io::TestExternalities = GenesisConfig {
+			pallet_balances: Some(pallet_balances::GenesisConfig::<Test>{
 				balances: vec![
 					(1, 10 * self.balance_factor),
 					(2, 20 * self.balance_factor),
@@ -218,7 +228,6 @@ impl ExtBuilder {
 					(5, 50 * self.balance_factor),
 					(6, 60 * self.balance_factor)
 				],
-				vesting: vec![],
 			}),
 			elections: Some(elections::GenesisConfig::<Test>{
 				members: vec![],
@@ -226,7 +235,9 @@ impl ExtBuilder {
 				presentation_duration: 2,
 				term_duration: 5,
 			}),
-		}.build_storage().unwrap().into()
+		}.build_storage().unwrap().into();
+		ext.execute_with(|| System::set_block_number(1));
+		ext
 	}
 }
 
@@ -273,7 +284,7 @@ pub(crate) fn locks(who: &u64) -> Vec<u64> {
 	Balances::locks(who).iter().map(|l| l.amount).collect::<Vec<u64>>()
 }
 
-pub(crate) fn new_test_ext_with_candidate_holes() -> runtime_io::TestExternalities {
+pub(crate) fn new_test_ext_with_candidate_holes() -> sp_io::TestExternalities {
 	let mut t = ExtBuilder::default().build();
 	t.execute_with(|| {
 		<elections::Candidates<Test>>::put(vec![0, 0, 1]);

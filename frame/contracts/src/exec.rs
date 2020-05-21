@@ -1,4 +1,4 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -17,25 +17,25 @@
 use super::{CodeHash, Config, ContractAddressFor, Event, RawEvent, Trait,
 	TrieId, BalanceOf, ContractInfo};
 use crate::account_db::{AccountDb, DirectAccountDb, OverlayAccountDb};
-use crate::gas::{Gas, GasMeter, Token, approx_gas_for_balance};
+use crate::gas::{Gas, GasMeter, Token};
 use crate::rent;
 
-use rstd::prelude::*;
-use sr_primitives::traits::{Bounded, CheckedAdd, CheckedSub, Zero};
-use support::{
-	storage::unhashed,
+use sp_std::prelude::*;
+use sp_runtime::traits::{Bounded, CheckedAdd, CheckedSub, Zero};
+use frame_support::{
+	storage::unhashed, dispatch::DispatchError,
 	traits::{WithdrawReason, Currency, Time, Randomness},
 };
 
-pub type AccountIdOf<T> = <T as system::Trait>::AccountId;
+pub type AccountIdOf<T> = <T as frame_system::Trait>::AccountId;
 pub type CallOf<T> = <T as Trait>::Call;
 pub type MomentOf<T> = <<T as Trait>::Time as Time>::Moment;
-pub type SeedOf<T> = <T as system::Trait>::Hash;
-pub type BlockNumberOf<T> = <T as system::Trait>::BlockNumber;
+pub type SeedOf<T> = <T as frame_system::Trait>::Hash;
+pub type BlockNumberOf<T> = <T as frame_system::Trait>::BlockNumber;
 pub type StorageKey = [u8; 32];
 
 /// A type that represents a topic of an event. At the moment a hash is used.
-pub type TopicOf<T> = <T as system::Trait>::Hash;
+pub type TopicOf<T> = <T as frame_system::Trait>::Hash;
 
 /// A status code return to the source of a contract call or instantiation indicating success or
 /// failure. A code of 0 indicates success and that changes are applied. All other codes indicate
@@ -64,9 +64,9 @@ impl ExecReturnValue {
 /// VM-specific errors during execution (eg. division by 0, OOB access, failure to satisfy some
 /// precondition of a system call, etc.) or errors with the orchestration (eg. out-of-gas errors, a
 /// non-existent destination contract, etc.).
-#[cfg_attr(test, derive(sr_primitives::RuntimeDebug))]
+#[cfg_attr(test, derive(sp_runtime::RuntimeDebug))]
 pub struct ExecError {
-	pub reason: &'static str,
+	pub reason: DispatchError,
 	/// This is an allocated buffer that may be reused. The buffer must be cleared explicitly
 	/// before reuse.
 	pub buffer: Vec<u8>,
@@ -83,7 +83,9 @@ macro_rules! try_or_exec_error {
 	($e:expr, $buffer:expr) => {
 		match $e {
 			Ok(val) => val,
-			Err(reason) => return Err($crate::exec::ExecError { reason, buffer: $buffer }),
+			Err(reason) => return Err(
+				$crate::exec::ExecError { reason: reason.into(), buffer: $buffer }
+			),
 		}
 	}
 }
@@ -117,6 +119,21 @@ pub trait Ext {
 		gas_meter: &mut GasMeter<Self::T>,
 		input_data: Vec<u8>,
 	) -> Result<(AccountIdOf<Self::T>, ExecReturnValue), ExecError>;
+
+	/// Transfer some amount of funds into the specified account.
+	fn transfer(
+		&mut self,
+		to: &AccountIdOf<Self::T>,
+		value: BalanceOf<Self::T>,
+		gas_meter: &mut GasMeter<Self::T>,
+	) -> Result<(), DispatchError>;
+
+	/// Transfer all funds to `beneficiary` and delete the contract.
+	fn terminate(
+		&mut self,
+		beneficiary: &AccountIdOf<Self::T>,
+		gas_meter: &mut GasMeter<Self::T>,
+	) -> Result<(), DispatchError>;
 
 	/// Call (possibly transferring some amount of funds) into the specified account.
 	fn call(
@@ -159,6 +176,9 @@ pub trait Ext {
 	/// Returns the minimum balance that is required for creating an account.
 	fn minimum_balance(&self) -> BalanceOf<Self::T>;
 
+	/// Returns the deposit required to create a tombstone upon contract eviction.
+	fn tombstone_deposit(&self) -> BalanceOf<Self::T>;
+
 	/// Returns a random number for the current block with the given subject.
 	fn random(&self, subject: &[u8]) -> SeedOf<Self::T>;
 
@@ -183,6 +203,9 @@ pub trait Ext {
 	///
 	/// Returns `None` if the value doesn't exist.
 	fn get_runtime_storage(&self, key: &[u8]) -> Option<Vec<u8>>;
+
+	/// Returns the price of one weight unit.
+	fn get_weight_price(&self) -> BalanceOf<Self::T>;
 }
 
 /// Loader is a companion of the `Vm` trait. It loads an appropriate abstract
@@ -239,7 +262,7 @@ impl<T: Trait> Token<T> for ExecFeeToken {
 }
 
 #[cfg_attr(any(feature = "std", test), derive(PartialEq, Eq, Clone))]
-#[derive(sr_primitives::RuntimeDebug)]
+#[derive(sp_runtime::RuntimeDebug)]
 pub enum DeferredAction<T: Trait> {
 	DepositEvent {
 		/// A list of topics this event will be deposited with.
@@ -269,7 +292,7 @@ pub enum DeferredAction<T: Trait> {
 }
 
 pub struct ExecutionContext<'a, T: Trait + 'a, V, L> {
-	pub parent: Option<&'a ExecutionContext<'a, T, V, L>>,
+	pub caller: Option<&'a ExecutionContext<'a, T, V, L>>,
 	pub self_account: T::AccountId,
 	pub self_trie_id: Option<TrieId>,
 	pub overlay: OverlayAccountDb<'a, T>,
@@ -294,7 +317,7 @@ where
 	/// account (not a contract).
 	pub fn top_level(origin: T::AccountId, cfg: &'a Config<T>, vm: &'a V, loader: &'a L) -> Self {
 		ExecutionContext {
-			parent: None,
+			caller: None,
 			self_trie_id: None,
 			self_account: origin,
 			overlay: OverlayAccountDb::<T>::new(&DirectAccountDb),
@@ -304,7 +327,7 @@ where
 			vm: &vm,
 			loader: &loader,
 			timestamp: T::Time::now(),
-			block_number: <system::Module<T>>::block_number(),
+			block_number: <frame_system::Module<T>>::block_number(),
 		}
 	}
 
@@ -312,7 +335,7 @@ where
 		-> ExecutionContext<'b, T, V, L>
 	{
 		ExecutionContext {
-			parent: Some(self),
+			caller: Some(self),
 			self_trie_id: trie_id,
 			self_account: dest,
 			overlay: OverlayAccountDb::new(&self.overlay),
@@ -326,6 +349,23 @@ where
 		}
 	}
 
+	/// Transfer balance to `dest` without calling any contract code.
+	pub fn transfer(
+		&mut self,
+		dest: T::AccountId,
+		value: BalanceOf<T>,
+		gas_meter: &mut GasMeter<T>
+	) -> Result<(), DispatchError> {
+		transfer(
+			gas_meter,
+			TransferCause::Call,
+			&self.self_account.clone(),
+			&dest,
+			value,
+			self,
+		)
+	}
+
 	/// Make a call to the specified address, optionally transferring some funds.
 	pub fn call(
 		&mut self,
@@ -336,7 +376,7 @@ where
 	) -> ExecResult {
 		if self.depth == self.config.max_depth as usize {
 			return Err(ExecError {
-				reason: "reached maximum depth, cannot make a call",
+				reason: "reached maximum depth, cannot make a call".into(),
 				buffer: input_data,
 			});
 		}
@@ -346,20 +386,20 @@ where
 			.is_out_of_gas()
 		{
 			return Err(ExecError {
-				reason: "not enough gas to pay base call fee",
+				reason: "not enough gas to pay base call fee".into(),
 				buffer: input_data,
 			});
 		}
 
-		// Assumption: pay_rent doesn't collide with overlay because
-		// pay_rent will be done on first call and dest contract and balance
+		// Assumption: `collect_rent` doesn't collide with overlay because
+		// `collect_rent` will be done on first call and destination contract and balance
 		// cannot be changed before the first call
-		let contract_info = rent::pay_rent::<T>(&dest);
+		let contract_info = rent::collect_rent::<T>(&dest);
 
 		// Calls to dead contracts always fail.
 		if let Some(ContractInfo::Tombstone(_)) = contract_info {
 			return Err(ExecError {
-				reason: "contract has been evicted",
+				reason: "contract has been evicted".into(),
 				buffer: input_data,
 			});
 		};
@@ -398,20 +438,6 @@ where
 							gas_meter,
 						)?;
 
-					// Destroy contract if insufficient remaining balance.
-					if nested.overlay.get_balance(&dest) < nested.config.existential_deposit {
-						let parent = nested.parent
-							.expect("a nested execution context must have a parent; qed");
-						if parent.is_live(&dest) {
-							return Err(ExecError {
-								reason: "contract cannot be destroyed during recursive execution",
-								buffer: output.data,
-							});
-						}
-
-						nested.overlay.destroy_contract(&dest);
-					}
-
 					Ok(output)
 				}
 				None => Ok(ExecReturnValue { status: STATUS_SUCCESS, data: Vec::new() }),
@@ -428,7 +454,7 @@ where
 	) -> Result<(T::AccountId, ExecReturnValue), ExecError> {
 		if self.depth == self.config.max_depth as usize {
 			return Err(ExecError {
-				reason: "reached maximum depth, cannot instantiate",
+				reason: "reached maximum depth, cannot instantiate".into(),
 				buffer: input_data,
 			});
 		}
@@ -438,7 +464,7 @@ where
 			.is_out_of_gas()
 		{
 			return Err(ExecError {
-				reason: "not enough gas to pay base instantiate fee",
+				reason: "not enough gas to pay base instantiate fee".into(),
 				buffer: input_data,
 			});
 		}
@@ -488,7 +514,7 @@ where
 			// Error out if insufficient remaining balance.
 			if nested.overlay.get_balance(&dest) < nested.config.existential_deposit {
 				return Err(ExecError {
-					reason: "insufficient remaining balance",
+					reason: "insufficient remaining balance".into(),
 					buffer: output.data,
 				});
 			}
@@ -505,9 +531,37 @@ where
 		Ok((dest, output))
 	}
 
-	fn new_call_context<'b>(&'b mut self, caller: T::AccountId, value: BalanceOf<T>)
-		-> CallContext<'b, 'a, T, V, L>
-	{
+	pub fn terminate(
+		&mut self,
+		beneficiary: &T::AccountId,
+		gas_meter: &mut GasMeter<T>,
+	) -> Result<(), DispatchError> {
+		let self_id = self.self_account.clone();
+		let value = self.overlay.get_balance(&self_id);
+		if let Some(caller) = self.caller {
+			if caller.is_live(&self_id) {
+				return Err(DispatchError::Other(
+					"Cannot terminate a contract that is present on the call stack",
+				));
+			}
+		}
+		transfer(
+			gas_meter,
+			TransferCause::Terminate,
+			&self_id,
+			beneficiary,
+			value,
+			self,
+		)?;
+		self.overlay.destroy_contract(&self_id);
+		Ok(())
+	}
+
+	fn new_call_context<'b>(
+		&'b mut self,
+		caller: T::AccountId,
+		value: BalanceOf<T>,
+	) -> CallContext<'b, 'a, T, V, L> {
 		let timestamp = self.timestamp.clone();
 		let block_number = self.block_number.clone();
 		CallContext {
@@ -541,7 +595,7 @@ where
 	/// stack, meaning it is in the middle of an execution.
 	fn is_live(&self, account: &T::AccountId) -> bool {
 		&self.self_account == account ||
-			self.parent.map_or(false, |parent| parent.is_live(account))
+			self.caller.map_or(false, |caller| caller.is_live(account))
 	}
 }
 
@@ -549,28 +603,24 @@ where
 #[derive(Copy, Clone)]
 pub enum TransferFeeKind {
 	ContractInstantiate,
-	AccountCreate,
 	Transfer,
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 #[derive(Copy, Clone)]
-pub struct TransferFeeToken<Balance> {
+pub struct TransferFeeToken {
 	kind: TransferFeeKind,
-	gas_price: Balance,
 }
 
-impl<T: Trait> Token<T> for TransferFeeToken<BalanceOf<T>> {
+impl<T: Trait> Token<T> for TransferFeeToken {
 	type Metadata = Config<T>;
 
 	#[inline]
 	fn calculate_amount(&self, metadata: &Config<T>) -> Gas {
-		let balance_fee = match self.kind {
-			TransferFeeKind::ContractInstantiate => metadata.contract_account_instantiate_fee,
-			TransferFeeKind::AccountCreate => metadata.account_create_fee,
-			TransferFeeKind::Transfer => metadata.transfer_fee,
-		};
-		approx_gas_for_balance(self.gas_price, balance_fee)
+		match self.kind {
+			TransferFeeKind::ContractInstantiate => metadata.schedule.instantiate_cost,
+			TransferFeeKind::Transfer => metadata.schedule.transfer_cost,
+		}
 	}
 }
 
@@ -578,6 +628,7 @@ impl<T: Trait> Token<T> for TransferFeeToken<BalanceOf<T>> {
 enum TransferCause {
 	Call,
 	Instantiate,
+	Terminate,
 }
 
 /// Transfer some funds from `transactor` to `dest`.
@@ -603,18 +654,9 @@ fn transfer<'a, T: Trait, V: Vm<T>, L: Loader<T>>(
 	dest: &T::AccountId,
 	value: BalanceOf<T>,
 	ctx: &mut ExecutionContext<'a, T, V, L>,
-) -> Result<(), &'static str> {
+) -> Result<(), DispatchError> {
 	use self::TransferCause::*;
 	use self::TransferFeeKind::*;
-
-	let to_balance = ctx.overlay.get_balance(dest);
-
-	// `would_create` indicates whether the account will be created if this transfer gets executed.
-	// This flag is orthogonal to `cause.
-	// For example, we can instantiate a contract at the address which already has some funds. In this
-	// `would_create` will be `false`. Another example would be when this function is called from `call`,
-	// and account with the address `dest` doesn't exist yet `would_create` will be `true`.
-	let would_create = to_balance.is_zero();
 
 	let token = {
 		let kind: TransferFeeKind = match cause {
@@ -622,38 +664,46 @@ fn transfer<'a, T: Trait, V: Vm<T>, L: Loader<T>>(
 			// charge contract account creation fee.
 			Instantiate => ContractInstantiate,
 
-			// Otherwise the fee depends on whether we create a new account or transfer
-			// to an existing one.
-			Call => if would_create {
-				TransferFeeKind::AccountCreate
-			} else {
-				TransferFeeKind::Transfer
-			},
+			// Otherwise the fee is to transfer to an account.
+			Call | Terminate => TransferFeeKind::Transfer,
 		};
 		TransferFeeToken {
 			kind,
-			gas_price: gas_meter.gas_price(),
 		}
 	};
 
 	if gas_meter.charge(ctx.config, token).is_out_of_gas() {
-		return Err("not enough gas to pay transfer fee");
+		Err("not enough gas to pay transfer fee")?
 	}
 
 	// We allow balance to go below the existential deposit here:
 	let from_balance = ctx.overlay.get_balance(transactor);
 	let new_from_balance = match from_balance.checked_sub(&value) {
 		Some(b) => b,
-		None => return Err("balance too low to send value"),
+		None => Err("balance too low to send value")?,
 	};
-	if would_create && value < ctx.config.existential_deposit {
-		return Err("value too low to create account");
+	let to_balance = ctx.overlay.get_balance(dest);
+	if to_balance.is_zero() && value < ctx.config.existential_deposit {
+		Err("value too low to create account")?
 	}
-	T::Currency::ensure_can_withdraw(transactor, value, WithdrawReason::Transfer.into(), new_from_balance)?;
+
+	// Only ext_terminate is allowed to bring the sender below the existential deposit
+	let required_balance = match cause {
+		Terminate => 0.into(),
+		_ => ctx.config.existential_deposit
+	};
+
+	T::Currency::ensure_can_withdraw(
+		transactor,
+		value,
+		WithdrawReason::Transfer.into(),
+		new_from_balance.checked_sub(&required_balance)
+			.ok_or("brings sender below existential deposit")?,
+	)?;
 
 	let new_to_balance = match to_balance.checked_add(&value) {
 		Some(b) => b,
-		None => return Err("destination balance too high to receive value"),
+		None => Err("destination balance too high to receive value")?,
 	};
 
 	if transactor != dest {
@@ -709,6 +759,23 @@ where
 		input_data: Vec<u8>,
 	) -> Result<(AccountIdOf<T>, ExecReturnValue), ExecError> {
 		self.ctx.instantiate(endowment, gas_meter, code_hash, input_data)
+	}
+
+	fn transfer(
+		&mut self,
+		to: &T::AccountId,
+		value: BalanceOf<T>,
+		gas_meter: &mut GasMeter<T>,
+	) -> Result<(), DispatchError> {
+		self.ctx.transfer(to.clone(), value, gas_meter)
+	}
+
+	fn terminate(
+		&mut self,
+		beneficiary: &AccountIdOf<Self::T>,
+		gas_meter: &mut GasMeter<Self::T>,
+	) -> Result<(), DispatchError> {
+		self.ctx.terminate(beneficiary, gas_meter)
 	}
 
 	fn call(
@@ -772,10 +839,14 @@ where
 		self.ctx.config.existential_deposit
 	}
 
+	fn tombstone_deposit(&self) -> BalanceOf<T> {
+		self.ctx.config.tombstone_deposit
+	}
+
 	fn deposit_event(&mut self, topics: Vec<T::Hash>, data: Vec<u8>) {
 		self.ctx.deferred.push(DeferredAction::DepositEvent {
 			topics,
-			event: RawEvent::Contract(self.ctx.self_account.clone(), data),
+			event: RawEvent::ContractExecution(self.ctx.self_account.clone(), data),
 		});
 	}
 
@@ -796,6 +867,13 @@ where
 
 	fn get_runtime_storage(&self, key: &[u8]) -> Option<Vec<u8>> {
 		unhashed::get_raw(&key)
+	}
+
+	fn get_weight_price(&self) -> BalanceOf<Self::T> {
+		use pallet_transaction_payment::Module as Payment;
+		use sp_runtime::SaturatedConversion;
+		let price = Payment::<T>::weight_to_fee_with_adjustment::<u128>(1);
+		price.saturated_into()
 	}
 }
 
@@ -818,13 +896,17 @@ mod tests {
 	use crate::{
 		account_db::AccountDb, gas::GasMeter, tests::{ExtBuilder, Test},
 		exec::{ExecReturnValue, ExecError, STATUS_SUCCESS}, CodeHash, Config,
+		gas::Gas,
 	};
 	use std::{cell::RefCell, rc::Rc, collections::HashMap, marker::PhantomData};
 	use assert_matches::assert_matches;
+	use sp_runtime::DispatchError;
 
 	const ALICE: u64 = 1;
 	const BOB: u64 = 2;
 	const CHARLIE: u64 = 3;
+
+	const GAS_LIMIT: Gas = 10_000_000_000;
 
 	impl<'a, T, V, L> ExecutionContext<'a, T, V, L>
 		where T: crate::Trait
@@ -871,7 +953,7 @@ mod tests {
 
 		fn insert(&mut self, f: impl Fn(MockCtx) -> ExecResult + 'a) -> CodeHash<Test> {
 			// Generate code hashes as monotonically increasing values.
-			let code_hash = <Test as system::Trait>::Hash::from_low_u64_be(self.counter);
+			let code_hash = <Test as frame_system::Trait>::Hash::from_low_u64_be(self.counter);
 
 			self.counter += 1;
 			self.map.insert(code_hash, MockExecutable::new(f));
@@ -931,7 +1013,7 @@ mod tests {
 	#[test]
 	fn it_works() {
 		let value = Default::default();
-		let mut gas_meter = GasMeter::<Test>::with_limit(10000, 1);
+		let mut gas_meter = GasMeter::<Test>::new(GAS_LIMIT);
 		let data = vec![];
 
 		let vm = MockVm::new();
@@ -972,7 +1054,7 @@ mod tests {
 			ctx.overlay.set_balance(&origin, 100);
 			ctx.overlay.set_balance(&dest, 0);
 
-			let mut gas_meter = GasMeter::<Test>::with_limit(1000, 1);
+			let mut gas_meter = GasMeter::<Test>::new(GAS_LIMIT);
 
 			let result = ctx.call(dest, 0, &mut gas_meter, vec![]);
 			assert_matches!(result, Ok(_));
@@ -992,9 +1074,9 @@ mod tests {
 
 			ctx.overlay.set_balance(&origin, 100);
 
-			let mut gas_meter = GasMeter::<Test>::with_limit(1000, 1);
+			let mut gas_meter = GasMeter::<Test>::new(GAS_LIMIT);
 
-			let result = ctx.instantiate(0, &mut gas_meter, &code, vec![]);
+			let result = ctx.instantiate(1, &mut gas_meter, &code, vec![]);
 			assert_matches!(result, Ok(_));
 
 			let mut toks = gas_meter.tokens().iter();
@@ -1021,7 +1103,7 @@ mod tests {
 			let output = ctx.call(
 				dest,
 				55,
-				&mut GasMeter::<Test>::with_limit(1000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			).unwrap();
 
@@ -1054,7 +1136,7 @@ mod tests {
 			let output = ctx.call(
 				dest,
 				55,
-				&mut GasMeter::<Test>::with_limit(1000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			).unwrap();
 
@@ -1080,7 +1162,7 @@ mod tests {
 			ctx.overlay.set_balance(&origin, 100);
 			ctx.overlay.set_balance(&dest, 0);
 
-			let mut gas_meter = GasMeter::<Test>::with_limit(1000, 1);
+			let mut gas_meter = GasMeter::<Test>::new(GAS_LIMIT);
 
 			let result = ctx.call(dest, 50, &mut gas_meter, vec![]);
 			assert_matches!(result, Ok(_));
@@ -1090,8 +1172,7 @@ mod tests {
 				toks,
 				ExecFeeToken::Call,
 				TransferFeeToken {
-					kind: TransferFeeKind::AccountCreate,
-					gas_price: 1u64
+					kind: TransferFeeKind::Transfer,
 				},
 			);
 		});
@@ -1106,7 +1187,7 @@ mod tests {
 			ctx.overlay.set_balance(&origin, 100);
 			ctx.overlay.set_balance(&dest, 15);
 
-			let mut gas_meter = GasMeter::<Test>::with_limit(1000, 1);
+			let mut gas_meter = GasMeter::<Test>::new(GAS_LIMIT);
 
 			let result = ctx.call(dest, 50, &mut gas_meter, vec![]);
 			assert_matches!(result, Ok(_));
@@ -1117,12 +1198,11 @@ mod tests {
 				ExecFeeToken::Call,
 				TransferFeeToken {
 					kind: TransferFeeKind::Transfer,
-					gas_price: 1u64
 				},
 			);
 		});
 
-		// This test sends 50 units of currency as an endownment to a newly
+		// This test sends 50 units of currency as an endowment to a newly
 		// instantiated contract.
 		ExtBuilder::default().existential_deposit(15).build().execute_with(|| {
 			let mut loader = MockLoader::empty();
@@ -1135,7 +1215,7 @@ mod tests {
 			ctx.overlay.set_balance(&origin, 100);
 			ctx.overlay.set_balance(&dest, 15);
 
-			let mut gas_meter = GasMeter::<Test>::with_limit(1000, 1);
+			let mut gas_meter = GasMeter::<Test>::new(GAS_LIMIT);
 
 			let result = ctx.instantiate(50, &mut gas_meter, &code, vec![]);
 			assert_matches!(result, Ok(_));
@@ -1146,7 +1226,6 @@ mod tests {
 				ExecFeeToken::Instantiate,
 				TransferFeeToken {
 					kind: TransferFeeKind::ContractInstantiate,
-					gas_price: 1u64
 				},
 			);
 		});
@@ -1170,13 +1249,16 @@ mod tests {
 			let result = ctx.call(
 				dest,
 				100,
-				&mut GasMeter::<Test>::with_limit(1000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			);
 
 			assert_matches!(
 				result,
-				Err(ExecError { reason: "balance too low to send value", buffer: _ })
+				Err(ExecError {
+					reason: DispatchError::Other("balance too low to send value"),
+					buffer: _,
+				})
 			);
 			assert_eq!(ctx.overlay.get_balance(&origin), 0);
 			assert_eq!(ctx.overlay.get_balance(&dest), 0);
@@ -1204,7 +1286,7 @@ mod tests {
 			let result = ctx.call(
 				dest,
 				0,
-				&mut GasMeter::<Test>::with_limit(1000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			);
 
@@ -1235,7 +1317,7 @@ mod tests {
 			let result = ctx.call(
 				dest,
 				0,
-				&mut GasMeter::<Test>::with_limit(1000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			);
 
@@ -1263,7 +1345,7 @@ mod tests {
 			let result = ctx.call(
 				BOB,
 				0,
-				&mut GasMeter::<Test>::with_limit(10000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![1, 2, 3, 4],
 			);
 			assert_matches!(result, Ok(_));
@@ -1284,9 +1366,11 @@ mod tests {
 			let cfg = Config::preload();
 			let mut ctx = ExecutionContext::top_level(ALICE, &cfg, &vm, &loader);
 
+			ctx.overlay.set_balance(&ALICE, 100);
+
 			let result = ctx.instantiate(
-				0,
-				&mut GasMeter::<Test>::with_limit(10000, 1),
+				1,
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				&input_data_ch,
 				vec![1, 2, 3, 4],
 			);
@@ -1313,7 +1397,10 @@ mod tests {
 				// Verify that we've got proper error and set `reached_bottom`.
 				assert_matches!(
 					r,
-					Err(ExecError { reason: "reached maximum depth, cannot make a call", buffer: _ })
+					Err(ExecError {
+						reason: DispatchError::Other("reached maximum depth, cannot make a call"),
+						buffer: _,
+					})
 				);
 				*reached_bottom = true;
 			} else {
@@ -1327,12 +1414,13 @@ mod tests {
 		ExtBuilder::default().build().execute_with(|| {
 			let cfg = Config::preload();
 			let mut ctx = ExecutionContext::top_level(ALICE, &cfg, &vm, &loader);
+			ctx.overlay.set_balance(&BOB, 1);
 			ctx.overlay.instantiate_contract(&BOB, recurse_ch).unwrap();
 
 			let result = ctx.call(
 				BOB,
 				value,
-				&mut GasMeter::<Test>::with_limit(100000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			);
 
@@ -1378,7 +1466,7 @@ mod tests {
 			let result = ctx.call(
 				dest,
 				0,
-				&mut GasMeter::<Test>::with_limit(10000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			);
 
@@ -1419,7 +1507,7 @@ mod tests {
 			let result = ctx.call(
 				BOB,
 				0,
-				&mut GasMeter::<Test>::with_limit(10000, 1),
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				vec![],
 			);
 
@@ -1441,7 +1529,7 @@ mod tests {
 			assert_matches!(
 				ctx.instantiate(
 					0, // <- zero endowment
-					&mut GasMeter::<Test>::with_limit(10000, 1),
+					&mut GasMeter::<Test>::new(GAS_LIMIT),
 					&dummy_ch,
 					vec![],
 				),
@@ -1467,7 +1555,7 @@ mod tests {
 			let instantiated_contract_address = assert_matches!(
 				ctx.instantiate(
 					100,
-					&mut GasMeter::<Test>::with_limit(10000, 1),
+					&mut GasMeter::<Test>::new(GAS_LIMIT),
 					&dummy_ch,
 					vec![],
 				),
@@ -1507,7 +1595,7 @@ mod tests {
 			let instantiated_contract_address = assert_matches!(
 				ctx.instantiate(
 					100,
-					&mut GasMeter::<Test>::with_limit(10000, 1),
+					&mut GasMeter::<Test>::new(GAS_LIMIT),
 					&dummy_ch,
 					vec![],
 				),
@@ -1548,10 +1636,11 @@ mod tests {
 			let cfg = Config::preload();
 			let mut ctx = ExecutionContext::top_level(ALICE, &cfg, &vm, &loader);
 			ctx.overlay.set_balance(&ALICE, 1000);
+			ctx.overlay.set_balance(&BOB, 100);
 			ctx.overlay.instantiate_contract(&BOB, instantiator_ch).unwrap();
 
 			assert_matches!(
-				ctx.call(BOB, 20, &mut GasMeter::<Test>::with_limit(1000, 1), vec![]),
+				ctx.call(BOB, 20, &mut GasMeter::<Test>::new(GAS_LIMIT), vec![]),
 				Ok(_)
 			);
 
@@ -1583,7 +1672,7 @@ mod tests {
 
 		let mut loader = MockLoader::empty();
 		let dummy_ch = loader.insert(
-			|_| Err(ExecError { reason: "It's a trap!", buffer: Vec::new() })
+			|_| Err(ExecError { reason: "It's a trap!".into(), buffer: Vec::new() })
 		);
 		let instantiator_ch = loader.insert({
 			let dummy_ch = dummy_ch.clone();
@@ -1596,7 +1685,7 @@ mod tests {
 						ctx.gas_meter,
 						vec![]
 					),
-					Err(ExecError { reason: "It's a trap!", buffer: _ })
+					Err(ExecError { reason: DispatchError::Other("It's a trap!"), buffer: _ })
 				);
 
 				exec_success()
@@ -1607,10 +1696,11 @@ mod tests {
 			let cfg = Config::preload();
 			let mut ctx = ExecutionContext::top_level(ALICE, &cfg, &vm, &loader);
 			ctx.overlay.set_balance(&ALICE, 1000);
+			ctx.overlay.set_balance(&BOB, 100);
 			ctx.overlay.instantiate_contract(&BOB, instantiator_ch).unwrap();
 
 			assert_matches!(
-				ctx.call(BOB, 20, &mut GasMeter::<Test>::with_limit(1000, 1), vec![]),
+				ctx.call(BOB, 20, &mut GasMeter::<Test>::new(GAS_LIMIT), vec![]),
 				Ok(_)
 			);
 
@@ -1623,6 +1713,45 @@ mod tests {
 				},
 			]);
 		});
+	}
+
+	#[test]
+	fn termination_from_instantiate_fails() {
+		let vm = MockVm::new();
+
+		let mut loader = MockLoader::empty();
+
+		let terminate_ch = loader.insert(|mut ctx| {
+			ctx.ext.terminate(&ALICE, &mut ctx.gas_meter).unwrap();
+			exec_success()
+		});
+
+		ExtBuilder::default()
+			.existential_deposit(15)
+			.build()
+			.execute_with(|| {
+				let cfg = Config::preload();
+				let mut ctx = ExecutionContext::top_level(ALICE, &cfg, &vm, &loader);
+				ctx.overlay.set_balance(&ALICE, 1000);
+
+				assert_matches!(
+					ctx.instantiate(
+						100,
+						&mut GasMeter::<Test>::new(GAS_LIMIT),
+						&terminate_ch,
+						vec![],
+					),
+					Err(ExecError {
+						reason: DispatchError::Other("insufficient remaining balance"),
+						buffer
+					}) if buffer == Vec::<u8>::new()
+				);
+
+				assert_eq!(
+					&ctx.events(),
+					&[]
+				);
+			});
 	}
 
 	#[test]
@@ -1640,9 +1769,11 @@ mod tests {
 			let cfg = Config::preload();
 			let mut ctx = ExecutionContext::top_level(ALICE, &cfg, &vm, &loader);
 
+			ctx.overlay.set_balance(&ALICE, 100);
+
 			let result = ctx.instantiate(
-				0,
-				&mut GasMeter::<Test>::with_limit(10000, 1),
+				1,
+				&mut GasMeter::<Test>::new(GAS_LIMIT),
 				&rent_allowance_ch,
 				vec![],
 			);

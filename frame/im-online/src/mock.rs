@@ -1,18 +1,19 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Test utilities
 
@@ -21,14 +22,13 @@
 use std::cell::RefCell;
 
 use crate::{Module, Trait};
-use sr_primitives::Perbill;
-use sr_staking_primitives::{SessionIndex, offence::ReportOffence};
-use sr_primitives::testing::{Header, UintAuthorityId, TestXt};
-use sr_primitives::traits::{IdentityLookup, BlakeTwo256, ConvertInto};
-use primitives::H256;
-use support::{impl_outer_origin, impl_outer_dispatch, parameter_types};
-use {runtime_io, system};
-
+use sp_runtime::Perbill;
+use sp_staking::{SessionIndex, offence::{ReportOffence, OffenceError}};
+use sp_runtime::testing::{Header, UintAuthorityId, TestXt};
+use sp_runtime::traits::{IdentityLookup, BlakeTwo256, ConvertInto};
+use sp_core::H256;
+use frame_support::{impl_outer_origin, impl_outer_dispatch, parameter_types, weights::Weight};
+use frame_system as system;
 impl_outer_origin!{
 	pub enum Origin for Runtime {}
 }
@@ -40,36 +40,38 @@ impl_outer_dispatch! {
 }
 
 thread_local! {
-	pub static VALIDATORS: RefCell<Option<Vec<u64>>> = RefCell::new(Some(vec![1, 2, 3]));
+	pub static VALIDATORS: RefCell<Option<Vec<u64>>> = RefCell::new(Some(vec![
+		1,
+		2,
+		3,
+	]));
 }
 
-pub struct TestOnSessionEnding;
-impl session::OnSessionEnding<u64> for TestOnSessionEnding {
-	fn on_session_ending(_ending_index: SessionIndex, _will_apply_at: SessionIndex)
-		-> Option<Vec<u64>>
-	{
+pub struct TestSessionManager;
+impl pallet_session::SessionManager<u64> for TestSessionManager {
+	fn new_session(_new_index: SessionIndex) -> Option<Vec<u64>> {
 		VALIDATORS.with(|l| l.borrow_mut().take())
 	}
+	fn end_session(_: SessionIndex) {}
+	fn start_session(_: SessionIndex) {}
 }
 
-impl session::historical::OnSessionEnding<u64, u64> for TestOnSessionEnding {
-	fn on_session_ending(_ending_index: SessionIndex, _will_apply_at: SessionIndex)
-		-> Option<(Vec<u64>, Vec<(u64, u64)>)>
-	{
+impl pallet_session::historical::SessionManager<u64, u64> for TestSessionManager {
+	fn new_session(_new_index: SessionIndex) -> Option<Vec<(u64, u64)>> {
 		VALIDATORS.with(|l| l
 			.borrow_mut()
 			.take()
 			.map(|validators| {
-				let full_identification = validators.iter().map(|v| (*v, *v)).collect();
-				(validators, full_identification)
+				validators.iter().map(|v| (*v, *v)).collect()
 			})
 		)
 	}
+	fn end_session(_: SessionIndex) {}
+	fn start_session(_: SessionIndex) {}
 }
 
 /// An extrinsic type used for tests.
 pub type Extrinsic = TestXt<Call, ()>;
-type SubmitTransaction = system::offchain::TransactionSubmitter<(), Call, Extrinsic>;
 type IdentificationTuple = (u64, u64);
 type Offence = crate::UnresponsivenessOffence<IdentificationTuple>;
 
@@ -80,28 +82,28 @@ thread_local! {
 /// A mock offence report handler.
 pub struct OffenceHandler;
 impl ReportOffence<u64, IdentificationTuple, Offence> for OffenceHandler {
-	fn report_offence(reporters: Vec<u64>, offence: Offence) {
+	fn report_offence(reporters: Vec<u64>, offence: Offence) -> Result<(), OffenceError> {
 		OFFENCES.with(|l| l.borrow_mut().push((reporters, offence)));
+		Ok(())
 	}
 }
 
-pub fn new_test_ext() -> runtime_io::TestExternalities {
-	let t = system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
+pub fn new_test_ext() -> sp_io::TestExternalities {
+	let t = frame_system::GenesisConfig::default().build_storage::<Runtime>().unwrap();
 	t.into()
 }
-
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Runtime;
 
 parameter_types! {
 	pub const BlockHashCount: u64 = 250;
-	pub const MaximumBlockWeight: u32 = 1024;
+	pub const MaximumBlockWeight: Weight = 1024;
 	pub const MaximumBlockLength: u32 = 2 * 1024;
 	pub const AvailableBlockRatio: Perbill = Perbill::one();
 }
 
-impl system::Trait for Runtime {
+impl frame_system::Trait for Runtime {
 	type Origin = Origin;
 	type Index = u64;
 	type BlockNumber = u64;
@@ -114,9 +116,17 @@ impl system::Trait for Runtime {
 	type Event = ();
 	type BlockHashCount = BlockHashCount;
 	type MaximumBlockWeight = MaximumBlockWeight;
+	type DbWeight = ();
+	type BlockExecutionWeight = ();
+	type ExtrinsicBaseWeight = ();
+	type MaximumExtrinsicWeight = MaximumBlockWeight;
 	type MaximumBlockLength = MaximumBlockLength;
 	type AvailableBlockRatio = AvailableBlockRatio;
 	type Version = ();
+	type ModuleToIndex = ();
+	type AccountData = ();
+	type OnNewAccount = ();
+	type OnKilledAccount = ();
 }
 
 parameter_types! {
@@ -128,19 +138,19 @@ parameter_types! {
 	pub const DisabledValidatorsThreshold: Perbill = Perbill::from_percent(33);
 }
 
-impl session::Trait for Runtime {
-	type ShouldEndSession = session::PeriodicSessions<Period, Offset>;
-	type OnSessionEnding = session::historical::NoteHistoricalRoot<Runtime, TestOnSessionEnding>;
+impl pallet_session::Trait for Runtime {
+	type ShouldEndSession = pallet_session::PeriodicSessions<Period, Offset>;
+	type SessionManager = pallet_session::historical::NoteHistoricalRoot<Runtime, TestSessionManager>;
 	type SessionHandler = (ImOnline, );
 	type ValidatorId = u64;
 	type ValidatorIdOf = ConvertInto;
 	type Keys = UintAuthorityId;
 	type Event = ();
-	type SelectInitialValidators = ();
 	type DisabledValidatorsThreshold = DisabledValidatorsThreshold;
+	type NextSessionRotation = pallet_session::PeriodicSessions<Period, Offset>;
 }
 
-impl session::historical::Trait for Runtime {
+impl pallet_session::historical::Trait for Runtime {
 	type FullIdentification = u64;
 	type FullIdentificationOf = ConvertInto;
 }
@@ -149,30 +159,42 @@ parameter_types! {
 	pub const UncleGenerations: u32 = 5;
 }
 
-impl authorship::Trait for Runtime {
+impl pallet_authorship::Trait for Runtime {
 	type FindAuthor = ();
 	type UncleGenerations = UncleGenerations;
 	type FilterUncle = ();
 	type EventHandler = ImOnline;
 }
 
+parameter_types! {
+	pub const UnsignedPriority: u64 = 1 << 20;
+}
+
 impl Trait for Runtime {
 	type AuthorityId = UintAuthorityId;
 	type Event = ();
-	type Call = Call;
-	type SubmitTransaction = SubmitTransaction;
 	type ReportUnresponsiveness = OffenceHandler;
 	type SessionDuration = Period;
+	type UnsignedPriority = UnsignedPriority;
+}
+
+impl<LocalCall> frame_system::offchain::SendTransactionTypes<LocalCall> for Runtime where
+	Call: From<LocalCall>,
+{
+	type OverarchingCall = Call;
+	type Extrinsic = Extrinsic;
 }
 
 /// Im Online module.
 pub type ImOnline = Module<Runtime>;
-pub type System = system::Module<Runtime>;
-pub type Session = session::Module<Runtime>;
+pub type System = frame_system::Module<Runtime>;
+pub type Session = pallet_session::Module<Runtime>;
 
 pub fn advance_session() {
-	let now = System::block_number();
+	let now = System::block_number().max(1);
 	System::set_block_number(now + 1);
 	Session::rotate_session();
+	let keys = Session::validators().into_iter().map(UintAuthorityId).collect();
+	ImOnline::set_keys(keys);
 	assert_eq!(Session::current_index(), (now / Period::get()) as u32);
 }

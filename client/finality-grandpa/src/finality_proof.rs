@@ -1,18 +1,20 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! GRANDPA block finality proof generation and check.
 //!
@@ -34,27 +36,27 @@
 //! finality proof (that finalizes some block C that is ancestor of the B and descendant
 //! of the U) could be returned.
 
-use std::iter;
 use std::sync::Arc;
 use log::{trace, warn};
 
 use sp_blockchain::{Backend as BlockchainBackend, Error as ClientError, Result as ClientResult};
-use client_api::{
-	backend::Backend, CallExecutor, StorageProof,
+use sc_client_api::{
+	backend::Backend, StorageProof,
 	light::{FetchChecker, RemoteReadRequest},
+	StorageProvider, ProofProvider,
 };
-use client::Client;
-use codec::{Encode, Decode};
-use grandpa::BlockNumberOps;
-use sr_primitives::{
+use parity_scale_codec::{Encode, Decode};
+use finality_grandpa::BlockNumberOps;
+use sp_runtime::{
 	Justification, generic::BlockId,
 	traits::{NumberFor, Block as BlockT, Header as HeaderT, One},
 };
-use primitives::{H256, Blake2Hasher, storage::StorageKey};
-use substrate_telemetry::{telemetry, CONSENSUS_INFO};
-use fg_primitives::{AuthorityId, AuthorityList, VersionedAuthorityList, GRANDPA_AUTHORITIES_KEY};
+use sp_core::storage::StorageKey;
+use sc_telemetry::{telemetry, CONSENSUS_INFO};
+use sp_finality_grandpa::{AuthorityId, AuthorityList, VersionedAuthorityList, GRANDPA_AUTHORITIES_KEY};
 
 use crate::justification::GrandpaJustification;
+use crate::VoterSet;
 
 /// Maximum number of fragments that we want to return in a single prove_finality call.
 const MAX_FRAGMENTS_IN_PROOF: usize = 8;
@@ -67,12 +69,25 @@ pub trait AuthoritySetForFinalityProver<Block: BlockT>: Send + Sync {
 	fn prove_authorities(&self, block: &BlockId<Block>) -> ClientResult<StorageProof>;
 }
 
-/// Client-based implementation of AuthoritySetForFinalityProver.
-impl<B, E, Block: BlockT<Hash=H256>, RA> AuthoritySetForFinalityProver<Block> for Client<B, E, Block, RA>
+/// Trait that combines `StorageProvider` and `ProofProvider`
+pub trait StorageAndProofProvider<Block, BE>: StorageProvider<Block, BE> + ProofProvider<Block> + Send + Sync
 	where
-		B: Backend<Block, Blake2Hasher> + Send + Sync + 'static,
-		E: CallExecutor<Block, Blake2Hasher> + 'static + Clone + Send + Sync,
-		RA: Send + Sync,
+		Block: BlockT,
+		BE: Backend<Block> + Send + Sync,
+{}
+
+/// Blanket implementation.
+impl<Block, BE, P> StorageAndProofProvider<Block, BE> for P
+	where
+		Block: BlockT,
+		BE: Backend<Block> + Send + Sync,
+		P: StorageProvider<Block, BE> + ProofProvider<Block> + Send + Sync,
+{}
+
+/// Implementation of AuthoritySetForFinalityProver.
+impl<BE, Block: BlockT> AuthoritySetForFinalityProver<Block> for Arc<dyn StorageAndProofProvider<Block, BE>>
+	where
+		BE: Backend<Block> + Send + Sync + 'static,
 {
 	fn authorities(&self, block: &BlockId<Block>) -> ClientResult<AuthorityList> {
 		let storage_key = StorageKey(GRANDPA_AUTHORITIES_KEY.to_vec());
@@ -83,7 +98,7 @@ impl<B, E, Block: BlockT<Hash=H256>, RA> AuthoritySetForFinalityProver<Block> fo
 	}
 
 	fn prove_authorities(&self, block: &BlockId<Block>) -> ClientResult<StorageProof> {
-		self.read_proof(block, iter::once(GRANDPA_AUTHORITIES_KEY))
+		self.read_proof(block, &mut std::iter::once(GRANDPA_AUTHORITIES_KEY))
 	}
 }
 
@@ -134,31 +149,33 @@ impl<Block: BlockT> AuthoritySetForFinalityChecker<Block> for Arc<dyn FetchCheck
 }
 
 /// Finality proof provider for serving network requests.
-pub struct FinalityProofProvider<B,  Block: BlockT<Hash=H256>> {
+pub struct FinalityProofProvider<B,  Block: BlockT> {
 	backend: Arc<B>,
 	authority_provider: Arc<dyn AuthoritySetForFinalityProver<Block>>,
 }
 
-impl<B, Block: BlockT<Hash=H256>> FinalityProofProvider<B, Block>
-	where B: Backend<Block, Blake2Hasher> + Send + Sync + 'static
+impl<B, Block: BlockT> FinalityProofProvider<B, Block>
+	where B: Backend<Block> + Send + Sync + 'static
 {
 	/// Create new finality proof provider using:
 	///
 	/// - backend for accessing blockchain data;
 	/// - authority_provider for calling and proving runtime methods.
-	pub fn new(
+	pub fn new<P>(
 		backend: Arc<B>,
-		authority_provider: Arc<dyn AuthoritySetForFinalityProver<Block>>,
-	) -> Self {
-		FinalityProofProvider { backend, authority_provider }
+		authority_provider: P,
+	) -> Self
+		where P: AuthoritySetForFinalityProver<Block> + 'static,
+	{
+		FinalityProofProvider { backend, authority_provider: Arc::new(authority_provider) }
 	}
 }
 
-impl<B, Block> network::FinalityProofProvider<Block> for FinalityProofProvider<B, Block>
+impl<B, Block> sc_network::config::FinalityProofProvider<Block> for FinalityProofProvider<B, Block>
 	where
-		Block: BlockT<Hash=H256>,
+		Block: BlockT,
 		NumberFor<Block>: BlockNumberOps,
-		B: Backend<Block, Blake2Hasher> + Send + Sync + 'static,
+		B: Backend<Block> + Send + Sync + 'static,
 {
 	fn prove_finality(
 		&self,
@@ -167,8 +184,8 @@ impl<B, Block> network::FinalityProofProvider<Block> for FinalityProofProvider<B
 	) -> Result<Option<Vec<u8>>, ClientError> {
 		let request: FinalityProofRequest<Block::Hash> = Decode::decode(&mut &request[..])
 			.map_err(|e| {
-				warn!(target: "finality", "Unable to decode finality proof request: {}", e.what());
-				ClientError::Backend(format!("Invalid finality proof request"))
+				warn!(target: "afg", "Unable to decode finality proof request: {}", e.what());
+				ClientError::Backend("Invalid finality proof request".to_string())
 			})?;
 		match request {
 			FinalityProofRequest::Original(request) => prove_finality::<_, _, GrandpaJustification<Block>>(
@@ -204,7 +221,7 @@ pub struct FinalityEffects<Header: HeaderT> {
 /// 2) headers sub-chain (B; F] if B != F;
 /// 3) proof of GRANDPA::authorities() if the set changes at block F.
 #[derive(Debug, PartialEq, Encode, Decode)]
-struct FinalityProofFragment<Header: HeaderT> {
+pub(crate) struct FinalityProofFragment<Header: HeaderT> {
 	/// The hash of block F for which justification is provided.
 	pub block: Header::Hash,
 	/// Justification of the block F.
@@ -252,7 +269,7 @@ pub(crate) fn make_finality_proof_request<H: Encode + Decode>(last_finalized: H,
 /// It is assumed that the caller already knows all blocks in the range (begin; end].
 ///
 /// Returns None if there are no finalized blocks unknown to the caller.
-pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Block>, J>(
+pub(crate) fn prove_finality<Block: BlockT, B: BlockchainBackend<Block>, J>(
 	blockchain: &B,
 	authorities_provider: &dyn AuthoritySetForFinalityProver<Block>,
 	authorities_set_id: u64,
@@ -269,7 +286,7 @@ pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Bloc
 	let info = blockchain.info();
 	if info.finalized_number <= begin_number {
 		trace!(
-			target: "finality",
+			target: "afg",
 			"Requested finality proof for descendant of #{} while we only have finalized #{}. Returning empty proof.",
 			begin_number,
 			info.finalized_number,
@@ -327,7 +344,7 @@ pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Bloc
 			let proof_fragment = FinalityProofFragment {
 				block: current,
 				justification,
-				unknown_headers: ::std::mem::replace(&mut unknown_headers, Vec::new()),
+				unknown_headers: ::std::mem::take(&mut unknown_headers),
 				authorities_proof: new_authorities_proof,
 			};
 
@@ -344,7 +361,7 @@ pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Bloc
 					);
 					if justification_check_result.is_err() {
 						trace!(
-							target: "finality",
+							target: "afg",
 							"Can not provide finality proof with requested set id #{}\
 							(possible forced change?). Returning empty proof.",
 							authorities_set_id,
@@ -382,12 +399,12 @@ pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Bloc
 		}
 
 		// else search for the next justification
-		current_number = current_number + One::one();
+		current_number += One::one();
 	}
 
 	if finality_proof.is_empty() {
 		trace!(
-			target: "finality",
+			target: "afg",
 			"No justifications found when making finality proof for {}. Returning empty proof.",
 			end,
 		);
@@ -395,7 +412,7 @@ pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Bloc
 		Ok(None)
 	} else {
 		trace!(
-			target: "finality",
+			target: "afg",
 			"Built finality proof for {} of {} fragments. Last fragment for {}.",
 			end,
 			finality_proof.len(),
@@ -410,26 +427,7 @@ pub(crate) fn prove_finality<Block: BlockT<Hash=H256>, B: BlockchainBackend<Bloc
 ///
 /// Returns the vector of headers that MUST be validated + imported
 /// AND if at least one of those headers is invalid, all other MUST be considered invalid.
-pub(crate) fn check_finality_proof<Block: BlockT<Hash=H256>, B>(
-	blockchain: &B,
-	current_set_id: u64,
-	current_authorities: AuthorityList,
-	authorities_provider: &dyn AuthoritySetForFinalityChecker<Block>,
-	remote_proof: Vec<u8>,
-) -> ClientResult<FinalityEffects<Block::Header>>
-	where
-		NumberFor<Block>: BlockNumberOps,
-		B: BlockchainBackend<Block>,
-{
-	do_check_finality_proof::<_, _, GrandpaJustification<Block>>(
-		blockchain,
-		current_set_id,
-		current_authorities,
-		authorities_provider,
-		remote_proof)
-}
-
-fn do_check_finality_proof<Block: BlockT<Hash=H256>, B, J>(
+pub(crate) fn check_finality_proof<Block: BlockT, B, J>(
 	blockchain: &B,
 	current_set_id: u64,
 	current_authorities: AuthorityList,
@@ -484,7 +482,7 @@ fn do_check_finality_proof<Block: BlockT<Hash=H256>, B, J>(
 }
 
 /// Check finality proof for the single block.
-fn check_finality_proof_fragment<Block: BlockT<Hash=H256>, B, J>(
+fn check_finality_proof_fragment<Block: BlockT, B, J>(
 	blockchain: &B,
 	authority_set: AuthoritiesOrEffects<Block::Header>,
 	authorities_provider: &dyn AuthoritySetForFinalityChecker<Block>,
@@ -517,7 +515,7 @@ fn check_finality_proof_fragment<Block: BlockT<Hash=H256>, B, J>(
 			new_authorities_proof,
 		)?;
 
-		current_set_id = current_set_id + 1;
+		current_set_id += 1;
 	}
 
 	Ok(AuthoritiesOrEffects::Effects(FinalityEffects {
@@ -569,24 +567,28 @@ pub(crate) trait ProvableJustification<Header: HeaderT>: Encode + Decode {
 	}
 }
 
-impl<Block: BlockT<Hash=H256>> ProvableJustification<Block::Header> for GrandpaJustification<Block>
+impl<Block: BlockT> ProvableJustification<Block::Header> for GrandpaJustification<Block>
 	where
 		NumberFor<Block>: BlockNumberOps,
 {
 	fn verify(&self, set_id: u64, authorities: &[(AuthorityId, u64)]) -> ClientResult<()> {
-		GrandpaJustification::verify(self, set_id, &authorities.iter().cloned().collect())
+		let authorities = VoterSet::new(authorities.iter().cloned()).ok_or(
+			ClientError::Consensus(sp_consensus::Error::InvalidAuthoritiesSet),
+		)?;
+
+		GrandpaJustification::verify(self, set_id, &authorities)
 	}
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-	use test_client::runtime::{Block, Header, H256};
-	use client_api::NewBlockState;
-	use test_client::client::in_mem::Blockchain as InMemoryBlockchain;
+	use substrate_test_runtime_client::runtime::{Block, Header, H256};
+	use sc_client_api::NewBlockState;
+	use sc_client_api::in_mem::Blockchain as InMemoryBlockchain;
 	use super::*;
-	use primitives::crypto::Public;
+	use sp_core::crypto::Public;
 
-	type FinalityProof = super::FinalityProof<Header>;
+	pub(crate) type FinalityProof = super::FinalityProof<Header>;
 
 	impl<GetAuthorities, ProveAuthorities> AuthoritySetForFinalityProver<Block> for (GetAuthorities, ProveAuthorities)
 		where
@@ -602,7 +604,7 @@ pub(crate) mod tests {
 		}
 	}
 
-	struct ClosureAuthoritySetForFinalityChecker<Closure>(pub Closure);
+	pub(crate) struct ClosureAuthoritySetForFinalityChecker<Closure>(pub Closure);
 
 	impl<Closure> AuthoritySetForFinalityChecker<Block> for ClosureAuthoritySetForFinalityChecker<Closure>
 		where
@@ -868,7 +870,7 @@ pub(crate) mod tests {
 		blockchain.insert(header(4).hash(), header(4), None, None, NewBlockState::Final).unwrap();
 		blockchain.insert(header(5).hash(), header(5), None, None, NewBlockState::Final).unwrap();
 		blockchain.insert(header(6).hash(), header(6), None, None, NewBlockState::Final).unwrap();
-		let effects = do_check_finality_proof::<_, _, TestJustification>(
+		let effects = check_finality_proof::<_, _, TestJustification>(
 			&blockchain,
 			0,
 			auth3,
@@ -896,7 +898,7 @@ pub(crate) mod tests {
 		let blockchain = test_blockchain();
 
 		// when we can't decode proof from Vec<u8>
-		do_check_finality_proof::<_, _, TestJustification>(
+		check_finality_proof::<_, _, TestJustification>(
 			&blockchain,
 			1,
 			vec![(AuthorityId::from_slice(&[3u8; 32]), 1u64)],
@@ -910,7 +912,7 @@ pub(crate) mod tests {
 		let blockchain = test_blockchain();
 
 		// when decoded proof has zero length
-		do_check_finality_proof::<_, _, TestJustification>(
+		check_finality_proof::<_, _, TestJustification>(
 			&blockchain,
 			1,
 			vec![(AuthorityId::from_slice(&[3u8; 32]), 1u64)],
@@ -920,12 +922,12 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn finality_proof_check_fails_when_intemediate_fragment_has_unknown_headers() {
+	fn finality_proof_check_fails_when_intermediate_fragment_has_unknown_headers() {
 		let blockchain = test_blockchain();
 
 		// when intermediate (#0) fragment has non-empty unknown headers
 		let authorities = vec![(AuthorityId::from_slice(&[3u8; 32]), 1u64)];
-		do_check_finality_proof::<_, _, TestJustification>(
+		check_finality_proof::<_, _, TestJustification>(
 			&blockchain,
 			1,
 			authorities.clone(),
@@ -945,12 +947,12 @@ pub(crate) mod tests {
 	}
 
 	#[test]
-	fn finality_proof_check_fails_when_intemediate_fragment_has_no_authorities_proof() {
+	fn finality_proof_check_fails_when_intermediate_fragment_has_no_authorities_proof() {
 		let blockchain = test_blockchain();
 
 		// when intermediate (#0) fragment has empty authorities proof
 		let authorities = vec![(AuthorityId::from_slice(&[3u8; 32]), 1u64)];
-		do_check_finality_proof::<_, _, TestJustification>(
+		check_finality_proof::<_, _, TestJustification>(
 			&blockchain,
 			1,
 			authorities.clone(),
@@ -975,7 +977,7 @@ pub(crate) mod tests {
 
 		let initial_authorities = vec![(AuthorityId::from_slice(&[3u8; 32]), 1u64)];
 		let next_authorities = vec![(AuthorityId::from_slice(&[4u8; 32]), 1u64)];
-		let effects = do_check_finality_proof::<_, _, TestJustification>(
+		let effects = check_finality_proof::<_, _, TestJustification>(
 			&blockchain,
 			1,
 			initial_authorities.clone(),
@@ -1004,7 +1006,7 @@ pub(crate) mod tests {
 	#[test]
 	fn finality_proof_is_none_if_first_justification_is_generated_by_unknown_set() {
 		// this is the case for forced change: set_id has been forcibly increased on full node
-		// and ligh node missed that
+		// and light node missed that
 		// => justification verification will fail on light node anyways, so we do not return
 		// finality proof at all
 		let blockchain = test_blockchain();

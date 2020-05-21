@@ -1,26 +1,27 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Support code for the runtime. A set of test accounts.
 
 use std::{collections::HashMap, ops::Deref};
 use lazy_static::lazy_static;
-use primitives::{ed25519::{Pair, Public, Signature}, Pair as PairT, Public as PublicT, H256};
-pub use primitives::ed25519;
-use sr_primitives::AccountId32;
+use sp_core::{ed25519::{Pair, Public, Signature}, Pair as PairT, Public as PublicT, H256};
+pub use sp_core::ed25519;
+use sp_runtime::AccountId32;
 
 /// Set of test accounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display, strum::EnumIter)]
@@ -106,9 +107,9 @@ impl From<Keyring> for &'static str {
 	}
 }
 
-impl From<Keyring> for sr_primitives::MultiSigner {
+impl From<Keyring> for sp_runtime::MultiSigner {
 	fn from(x: Keyring) -> Self {
-		sr_primitives::MultiSigner::Ed25519(x.into())
+		sp_runtime::MultiSigner::Ed25519(x.into())
 	}
 }
 
@@ -180,7 +181,7 @@ impl Deref for Keyring {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use primitives::{ed25519::Pair, Pair as PairT};
+	use sp_core::{ed25519::Pair, Pair as PairT};
 
 	#[test]
 	fn should_work() {

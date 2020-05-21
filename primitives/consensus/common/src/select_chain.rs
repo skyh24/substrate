@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate Consensus Common.
 
 // Substrate Demo is free software: you can redistribute it and/or modify
@@ -15,23 +15,23 @@
 // along with Substrate Consensus Common.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::error::Error;
-use sr_primitives::traits::{Block as BlockT, NumberFor};
+use sp_runtime::traits::{Block as BlockT, NumberFor};
 
 
 /// The SelectChain trait defines the strategy upon which the head is chosen
 /// if multiple forks are present for an opaque definition of "best" in the
 /// specific chain build.
 ///
-/// The Strategy can be customised for the two use cases of authoring new blocks
-/// upon the best chain or which fork to finalise. Unless implemented differently
-/// by default finalisation methods fall back to use authoring, so as a minimum
+/// The Strategy can be customized for the two use cases of authoring new blocks
+/// upon the best chain or which fork to finalize. Unless implemented differently
+/// by default finalization methods fall back to use authoring, so as a minimum
 /// `_authoring`-functions must be implemented.
 ///
-/// Any particular user must make explicit, however, whether they intend to finalise
+/// Any particular user must make explicit, however, whether they intend to finalize
 /// or author through the using the right function call, as these might differ in
 /// some implementations.
 ///
-/// Non-deterministicly finalising chains may only use the `_authoring` functions.
+/// Non-deterministically finalizing chains may only use the `_authoring` functions.
 pub trait SelectChain<Block: BlockT>: Sync + Send + Clone {
 
 	/// Get all leaves of the chain: block hashes that have no children currently.

@@ -1,24 +1,25 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use super::{TestExternalities, call_in_wasm};
 use crate::WasmExecutionMethod;
 
 use codec::Encode;
-use runtime_test::WASM_BINARY;
 use test_case::test_case;
 use wabt;
 
@@ -27,7 +28,6 @@ use wabt;
 fn sandbox_should_work(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -56,8 +56,6 @@ fn sandbox_should_work(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		true.encode(),
 	);
@@ -68,7 +66,6 @@ fn sandbox_should_work(wasm_method: WasmExecutionMethod) {
 fn sandbox_trap(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -86,8 +83,6 @@ fn sandbox_trap(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		vec![0],
 	);
@@ -95,38 +90,9 @@ fn sandbox_trap(wasm_method: WasmExecutionMethod) {
 
 #[test_case(WasmExecutionMethod::Interpreted)]
 #[cfg_attr(feature = "wasmtime", test_case(WasmExecutionMethod::Compiled))]
-#[should_panic(expected = "Allocator ran out of space")]
-fn sandbox_should_trap_when_heap_exhausted(wasm_method: WasmExecutionMethod) {
-	let mut ext = TestExternalities::default();
-	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
-
-	let code = wabt::wat2wasm(r#"
-		(module
-			(import "env" "assert" (func $assert (param i32)))
-			(func (export "call")
-				i32.const 0
-				call $assert
-			)
-		)
-		"#).unwrap().encode();
-
-	call_in_wasm(
-		"test_exhaust_heap",
-		&code,
-		wasm_method,
-		&mut ext,
-		&test_code[..],
-		8,
-	).unwrap();
-}
-
-#[test_case(WasmExecutionMethod::Interpreted)]
-#[cfg_attr(feature = "wasmtime", test_case(WasmExecutionMethod::Compiled))]
 fn start_called(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -161,8 +127,6 @@ fn start_called(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		true.encode(),
 	);
@@ -173,7 +137,6 @@ fn start_called(wasm_method: WasmExecutionMethod) {
 fn invoke_args(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -204,8 +167,6 @@ fn invoke_args(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		true.encode(),
 	);
@@ -216,7 +177,6 @@ fn invoke_args(wasm_method: WasmExecutionMethod) {
 fn return_val(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -235,8 +195,6 @@ fn return_val(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		true.encode(),
 	);
@@ -247,7 +205,6 @@ fn return_val(wasm_method: WasmExecutionMethod) {
 fn unlinkable_module(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -264,8 +221,6 @@ fn unlinkable_module(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		1u8.encode(),
 	);
@@ -276,7 +231,6 @@ fn unlinkable_module(wasm_method: WasmExecutionMethod) {
 fn corrupted_module(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	// Corrupted wasm file
 	let code = vec![0u8, 0, 0, 0, 1, 0, 0, 0].encode();
@@ -287,8 +241,6 @@ fn corrupted_module(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		1u8.encode(),
 	);
@@ -299,7 +251,6 @@ fn corrupted_module(wasm_method: WasmExecutionMethod) {
 fn start_fn_ok(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -319,8 +270,6 @@ fn start_fn_ok(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		0u8.encode(),
 	);
@@ -331,7 +280,6 @@ fn start_fn_ok(wasm_method: WasmExecutionMethod) {
 fn start_fn_traps(wasm_method: WasmExecutionMethod) {
 	let mut ext = TestExternalities::default();
 	let mut ext = ext.ext();
-	let test_code = WASM_BINARY;
 
 	let code = wabt::wat2wasm(r#"
 		(module
@@ -352,9 +300,30 @@ fn start_fn_traps(wasm_method: WasmExecutionMethod) {
 			&code,
 			wasm_method,
 			&mut ext,
-			&test_code[..],
-			8,
 		).unwrap(),
 		2u8.encode(),
+	);
+}
+
+#[test_case(WasmExecutionMethod::Interpreted)]
+#[cfg_attr(feature = "wasmtime", test_case(WasmExecutionMethod::Compiled))]
+fn get_global_val_works(wasm_method: WasmExecutionMethod) {
+	let mut ext = TestExternalities::default();
+	let mut ext = ext.ext();
+
+	let code = wabt::wat2wasm(r#"
+		(module
+			(global (export "test_global") i64 (i64.const 500))
+		)
+		"#).unwrap().encode();
+
+	assert_eq!(
+		call_in_wasm(
+			"test_sandbox_get_global_val",
+			&code,
+			wasm_method,
+			&mut ext,
+		).unwrap(),
+		500i64.encode(),
 	);
 }

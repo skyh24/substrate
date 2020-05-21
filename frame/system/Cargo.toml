@@ -1,36 +1,47 @@
 [package]
 name = "frame-system"
-version = "2.0.0"
+version = "2.0.0-dev"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2018"
+license = "Apache-2.0"
+homepage = "https://substrate.dev"
+repository = "https://github.com/paritytech/substrate/"
+description = "FRAME system module"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 serde = { version = "1.0.101", optional = true, features = ["derive"] }
-safe-mix = { version = "1.0.0", default-features = false }
-codec = { package = "parity-scale-codec", version = "1.0.0", default-features = false, features = ["derive"] }
-primitives = { package = "substrate-primitives",  path = "../../primitives/core", default-features = false }
-rstd = { package = "sr-std", path = "../../primitives/sr-std", default-features = false }
-runtime-io ={ package = "sr-io", path = "../../primitives/sr-io", default-features = false }
-sr-primitives = { path = "../../primitives/sr-primitives", default-features = false }
-sr-version = { path = "../../primitives/sr-version", default-features = false }
-support = { package = "frame-support", path = "../support", default-features = false }
+codec = { package = "parity-scale-codec", version = "1.3.0", default-features = false, features = ["derive"] }
+sp-core = { version = "2.0.0-dev", default-features = false, path = "../../primitives/core" }
+sp-std = { version = "2.0.0-dev", default-features = false, path = "../../primitives/std" }
+sp-io = { version = "2.0.0-dev", path = "../../primitives/io", default-features = false }
+sp-runtime = { version = "2.0.0-dev", default-features = false, path = "../../primitives/runtime" }
+sp-version = { version = "2.0.0-dev", default-features = false, path = "../../primitives/version" }
+frame-support = { version = "2.0.0-dev", default-features = false, path = "../support" }
 impl-trait-for-tuples = "0.1.3"
 
 [dev-dependencies]
 criterion = "0.2.11"
+sp-externalities = { version = "0.8.0-dev", path = "../../primitives/externalities" }
+substrate-test-runtime-client = { version = "2.0.0-dev", path = "../../test-utils/runtime/client" }
 
 [features]
 default = ["std"]
 std = [
 	"serde",
-	"safe-mix/std",
 	"codec/std",
-	"primitives/std",
-	"rstd/std",
-	"runtime-io/std",
-	"support/std",
-	"sr-primitives/std",
-	"sr-version/std",
+	"sp-core/std",
+	"sp-std/std",
+	"sp-io/std",
+	"frame-support/std",
+	"sp-runtime/std",
+	"sp-version/std",
+]
+runtime-benchmarks = [
+	"sp-runtime/runtime-benchmarks",
+	"frame-support/runtime-benchmarks",
 ]
 
 [[bench]]

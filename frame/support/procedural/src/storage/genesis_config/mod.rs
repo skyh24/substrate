@@ -1,18 +1,19 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Declaration of genesis config structure and implementation of build storage trait and
 //! functions.
@@ -66,6 +67,7 @@ fn decl_genesis_config_and_impl_default(
 	let genesis_where_clause = &genesis_config.genesis_where_clause;
 
 	quote!(
+		/// Genesis config for the module, allow to build genesis storage.
 		#[derive(#scrate::Serialize, #scrate::Deserialize)]
 		#[cfg(feature = "std")]
 		#[serde(rename_all = "camelCase")]
@@ -132,20 +134,18 @@ fn impl_build_storage(
 	let builder_blocks = &builders.blocks;
 
 	let build_storage_impl_trait = quote!(
-		#scrate::sr_primitives::BuildModuleGenesisStorage<#runtime_generic, #inherent_instance>
+		#scrate::sp_runtime::BuildModuleGenesisStorage<#runtime_generic, #inherent_instance>
 	);
 
 	quote!{
 		#[cfg(feature = "std")]
 		impl#genesis_impl GenesisConfig#genesis_struct #genesis_where_clause {
+			/// Build the storage for this module.
 			pub fn build_storage #fn_generic (&self) -> std::result::Result<
-				(
-					#scrate::sr_primitives::StorageOverlay,
-					#scrate::sr_primitives::ChildrenStorageOverlay,
-				),
+				#scrate::sp_runtime::Storage,
 				String
 			> #fn_where_clause {
-				let mut storage = (Default::default(), Default::default());
+				let mut storage = Default::default();
 				self.assimilate_storage::<#fn_traitinstance>(&mut storage)?;
 				Ok(storage)
 			}
@@ -153,12 +153,9 @@ fn impl_build_storage(
 			/// Assimilate the storage for this module into pre-existing overlays.
 			pub fn assimilate_storage #fn_generic (
 				&self,
-				tuple_storage: &mut (
-					#scrate::sr_primitives::StorageOverlay,
-					#scrate::sr_primitives::ChildrenStorageOverlay,
-				),
+				storage: &mut #scrate::sp_runtime::Storage,
 			) -> std::result::Result<(), String> #fn_where_clause {
-				#scrate::BasicExternalities::execute_with_storage(tuple_storage, || {
+				#scrate::BasicExternalities::execute_with_storage(storage, || {
 					#( #builder_blocks )*
 					Ok(())
 				})
@@ -171,10 +168,7 @@ fn impl_build_storage(
 		{
 			fn build_module_genesis_storage(
 				&self,
-				storage: &mut (
-					#scrate::sr_primitives::StorageOverlay,
-					#scrate::sr_primitives::ChildrenStorageOverlay,
-				),
+				storage: &mut #scrate::sp_runtime::Storage,
 			) -> std::result::Result<(), String> {
 				self.assimilate_storage::<#fn_traitinstance> (storage)
 			}

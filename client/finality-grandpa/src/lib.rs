@@ -1,18 +1,20 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Integration of the GRANDPA finality gadget into substrate.
 //!
@@ -52,30 +54,55 @@
 //! or prune any signaled changes based on whether the signaling block is
 //! included in the newly-finalized chain.
 
+#![warn(missing_docs)]
+
 use futures::prelude::*;
-use log::{debug, error, info};
-use futures::sync::mpsc;
-use client_api::{BlockchainEvents, CallExecutor, backend::Backend, ExecutionStrategy};
-use sp_blockchain::{HeaderBackend, Error as ClientError};
-use client::Client;
-use codec::{Decode, Encode};
-use sr_primitives::generic::BlockId;
-use sr_primitives::traits::{NumberFor, Block as BlockT, DigestFor, Zero};
-use keystore::KeyStorePtr;
-use inherents::InherentDataProviders;
-use consensus_common::SelectChain;
-use primitives::{H256, Blake2Hasher, Pair};
-use substrate_telemetry::{telemetry, CONSENSUS_INFO, CONSENSUS_DEBUG, CONSENSUS_WARN};
-use serde_json;
+use futures::StreamExt;
+use log::{debug, info};
+use sc_client_api::{
+	backend::{AuxStore, Backend},
+	LockImportRun, BlockchainEvents, CallExecutor,
+	ExecutionStrategy, Finalizer, TransactionFor, ExecutorProvider,
+};
+use parity_scale_codec::{Decode, Encode};
+use prometheus_endpoint::{PrometheusError, Registry};
+use sp_api::ProvideRuntimeApi;
+use sp_blockchain::{HeaderBackend, Error as ClientError, HeaderMetadata};
+use sp_runtime::generic::BlockId;
+use sp_runtime::traits::{NumberFor, Block as BlockT, DigestFor, Zero};
+use sc_keystore::KeyStorePtr;
+use sp_inherents::InherentDataProviders;
+use sp_consensus::{SelectChain, BlockImport};
+use sp_core::Pair;
+use sp_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver};
+use sc_telemetry::{telemetry, CONSENSUS_INFO, CONSENSUS_DEBUG};
+use parking_lot::RwLock;
 
-use sp_finality_tracker;
+use finality_grandpa::Error as GrandpaError;
+use finality_grandpa::{voter, BlockNumberOps, voter_set::VoterSet};
 
-use grandpa::Error as GrandpaError;
-use grandpa::{voter, BlockNumberOps, voter_set::VoterSet};
-
-use std::fmt;
+use std::{fmt, io};
 use std::sync::Arc;
 use std::time::Duration;
+use std::pin::Pin;
+use std::task::{Poll, Context};
+
+// utility logging macro that takes as first argument a conditional to
+// decide whether to log under debug or info level (useful to restrict
+// logging under initial sync).
+macro_rules! afg_log {
+	($condition:expr, $($msg: expr),+ $(,)?) => {
+		{
+			let log_level = if $condition {
+				log::Level::Debug
+			} else {
+				log::Level::Info
+			};
+
+			log::log!(target: "afg", log_level, $($msg),+);
+		}
+	};
+}
 
 mod authorities;
 mod aux_schema;
@@ -90,32 +117,34 @@ mod observer;
 mod until_imported;
 mod voting_rule;
 
-pub use communication::Network;
-pub use finality_proof::FinalityProofProvider;
+pub use authorities::SharedAuthoritySet;
+pub use finality_proof::{FinalityProofProvider, StorageAndProofProvider};
+pub use import::GrandpaBlockImport;
 pub use justification::GrandpaJustification;
 pub use light_import::light_block_import;
-pub use observer::run_grandpa_observer;
 pub use voting_rule::{
-	BeforeBestBlock, ThreeQuartersOfTheUnfinalizedChain, VotingRule, VotingRulesBuilder
+	BeforeBestBlockBy, ThreeQuartersOfTheUnfinalizedChain, VotingRule, VotingRulesBuilder
 };
+pub use finality_grandpa::voter::report;
 
 use aux_schema::PersistentData;
 use environment::{Environment, VoterSetState};
-use import::GrandpaBlockImport;
 use until_imported::UntilGlobalMessageBlocksImported;
-use communication::NetworkBridge;
-use fg_primitives::{AuthorityList, AuthorityPair, AuthoritySignature, SetId};
+use communication::{NetworkBridge, Network as NetworkT};
+use sp_finality_grandpa::{AuthorityList, AuthorityPair, AuthoritySignature, SetId};
 
 // Re-export these two because it's just so damn convenient.
-pub use fg_primitives::{AuthorityId, ScheduledChange};
+pub use sp_finality_grandpa::{AuthorityId, GrandpaApi, ScheduledChange};
+use std::marker::PhantomData;
 
 #[cfg(test)]
 mod tests;
 
 /// A GRANDPA message for a substrate chain.
-pub type Message<Block> = grandpa::Message<<Block as BlockT>::Hash, NumberFor<Block>>;
+pub type Message<Block> = finality_grandpa::Message<<Block as BlockT>::Hash, NumberFor<Block>>;
+
 /// A signed message.
-pub type SignedMessage<Block> = grandpa::SignedMessage<
+pub type SignedMessage<Block> = finality_grandpa::SignedMessage<
 	<Block as BlockT>::Hash,
 	NumberFor<Block>,
 	AuthoritySignature,
@@ -123,27 +152,27 @@ pub type SignedMessage<Block> = grandpa::SignedMessage<
 >;
 
 /// A primary propose message for this chain's block type.
-pub type PrimaryPropose<Block> = grandpa::PrimaryPropose<<Block as BlockT>::Hash, NumberFor<Block>>;
+pub type PrimaryPropose<Block> = finality_grandpa::PrimaryPropose<<Block as BlockT>::Hash, NumberFor<Block>>;
 /// A prevote message for this chain's block type.
-pub type Prevote<Block> = grandpa::Prevote<<Block as BlockT>::Hash, NumberFor<Block>>;
+pub type Prevote<Block> = finality_grandpa::Prevote<<Block as BlockT>::Hash, NumberFor<Block>>;
 /// A precommit message for this chain's block type.
-pub type Precommit<Block> = grandpa::Precommit<<Block as BlockT>::Hash, NumberFor<Block>>;
+pub type Precommit<Block> = finality_grandpa::Precommit<<Block as BlockT>::Hash, NumberFor<Block>>;
 /// A catch up message for this chain's block type.
-pub type CatchUp<Block> = grandpa::CatchUp<
+pub type CatchUp<Block> = finality_grandpa::CatchUp<
 	<Block as BlockT>::Hash,
 	NumberFor<Block>,
 	AuthoritySignature,
 	AuthorityId,
 >;
 /// A commit message for this chain's block type.
-pub type Commit<Block> = grandpa::Commit<
+pub type Commit<Block> = finality_grandpa::Commit<
 	<Block as BlockT>::Hash,
 	NumberFor<Block>,
 	AuthoritySignature,
 	AuthorityId,
 >;
 /// A compact commit message for this chain's block type.
-pub type CompactCommit<Block> = grandpa::CompactCommit<
+pub type CompactCommit<Block> = finality_grandpa::CompactCommit<
 	<Block as BlockT>::Hash,
 	NumberFor<Block>,
 	AuthoritySignature,
@@ -152,7 +181,7 @@ pub type CompactCommit<Block> = grandpa::CompactCommit<
 /// A global communication input stream for commits and catch up messages. Not
 /// exposed publicly, used internally to simplify types in the communication
 /// layer.
-type CommunicationIn<Block> = grandpa::voter::CommunicationIn<
+type CommunicationIn<Block> = finality_grandpa::voter::CommunicationIn<
 	<Block as BlockT>::Hash,
 	NumberFor<Block>,
 	AuthoritySignature,
@@ -162,17 +191,8 @@ type CommunicationIn<Block> = grandpa::voter::CommunicationIn<
 /// Global communication input stream for commits and catch up messages, with
 /// the hash type not being derived from the block, useful for forcing the hash
 /// to some type (e.g. `H256`) when the compiler can't do the inference.
-type CommunicationInH<Block, H> = grandpa::voter::CommunicationIn<
+type CommunicationInH<Block, H> = finality_grandpa::voter::CommunicationIn<
 	H,
-	NumberFor<Block>,
-	AuthoritySignature,
-	AuthorityId,
->;
-
-/// A global communication sink for commits. Not exposed publicly, used
-/// internally to simplify types in the communication layer.
-type CommunicationOut<Block> = grandpa::voter::CommunicationOut<
-	<Block as BlockT>::Hash,
 	NumberFor<Block>,
 	AuthoritySignature,
 	AuthorityId,
@@ -181,14 +201,51 @@ type CommunicationOut<Block> = grandpa::voter::CommunicationOut<
 /// Global communication sink for commits with the hash type not being derived
 /// from the block, useful for forcing the hash to some type (e.g. `H256`) when
 /// the compiler can't do the inference.
-type CommunicationOutH<Block, H> = grandpa::voter::CommunicationOut<
+type CommunicationOutH<Block, H> = finality_grandpa::voter::CommunicationOut<
 	H,
 	NumberFor<Block>,
 	AuthoritySignature,
 	AuthorityId,
 >;
 
-/// Configuration for the GRANDPA service.
+/// Shared voter state for querying.
+pub struct SharedVoterState {
+	inner: Arc<RwLock<Option<Box<dyn voter::VoterState<AuthorityId> + Sync + Send>>>>,
+}
+
+impl SharedVoterState {
+	/// Create a new empty `SharedVoterState` instance.
+	pub fn empty() -> Self {
+		Self {
+			inner: Arc::new(RwLock::new(None)),
+		}
+	}
+
+	fn reset(
+		&self,
+		voter_state: Box<dyn voter::VoterState<AuthorityId> + Sync + Send>,
+	) -> Option<()> {
+		let mut shared_voter_state = self
+			.inner
+			.try_write_for(Duration::from_secs(1))?;
+
+		*shared_voter_state = Some(voter_state);
+		Some(())
+	}
+
+	/// Get the inner `VoterState` instance.
+	pub fn voter_state(&self) -> Option<voter::report::VoterState<AuthorityId>> {
+		self.inner.read().as_ref().map(|vs| vs.get())
+	}
+}
+
+impl Clone for SharedVoterState {
+	fn clone(&self) -> Self {
+		SharedVoterState { inner: self.inner.clone() }
+	}
+}
+
+/// Configuration for the GRANDPA service
 #[derive(Clone)]
 pub struct Config {
 	/// The expected duration for a message to be gossiped across the network.
@@ -207,7 +264,7 @@ pub struct Config {
 	/// Some local identifier of the voter.
 	pub name: Option<String>,
 	/// The keystore that manages the keys of this node.
-	pub keystore: Option<keystore::KeyStorePtr>,
+	pub keystore: Option<sc_keystore::KeyStorePtr>,
 }
 
 impl Config {
@@ -230,7 +287,7 @@ pub enum Error {
 	/// An invariant has been violated (e.g. not finalizing pending change blocks in-order)
 	Safety(String),
 	/// A timer failed to fire.
-	Timer(tokio_timer::Error),
+	Timer(io::Error),
 }
 
 impl From<GrandpaError> for Error {
@@ -253,10 +310,8 @@ pub(crate) trait BlockStatus<Block: BlockT> {
 	fn block_number(&self, hash: Block::Hash) -> Result<Option<NumberFor<Block>>, Error>;
 }
 
-impl<B, E, Block: BlockT<Hash=H256>, RA> BlockStatus<Block> for Arc<Client<B, E, Block, RA>> where
-	B: Backend<Block, Blake2Hasher>,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync,
-	RA: Send + Sync,
+impl<Block: BlockT, Client> BlockStatus<Block> for Arc<Client> where
+	Client: HeaderBackend<Block>,
 	NumberFor<Block>: BlockNumberOps,
 {
 	fn block_number(&self, hash: Block::Hash) -> Result<Option<NumberFor<Block>>, Error> {
@@ -264,6 +319,29 @@ impl<B, E, Block: BlockT<Hash=H256>, RA> BlockStatus<Block> for Arc<Client<B, E,
 			.map_err(|e| Error::Blockchain(format!("{:?}", e)))
 	}
 }
+
+/// A trait that includes all the client functionalities grandpa requires.
+/// Ideally this would be a trait alias, we're not there yet.
+/// tracking issue https://github.com/rust-lang/rust/issues/41517
+pub trait ClientForGrandpa<Block, BE>:
+	LockImportRun<Block, BE> + Finalizer<Block, BE> + AuxStore
+	+ HeaderMetadata<Block, Error = sp_blockchain::Error> + HeaderBackend<Block>
+	+ BlockchainEvents<Block> + ProvideRuntimeApi<Block> + ExecutorProvider<Block>
+	+ BlockImport<Block, Transaction = TransactionFor<BE, Block>, Error = sp_consensus::Error>
+	where
+		BE: Backend<Block>,
+		Block: BlockT,
+{}
+
+impl<Block, BE, T> ClientForGrandpa<Block, BE> for T
+	where
+		BE: Backend<Block>,
+		Block: BlockT,
+		T: LockImportRun<Block, BE> + Finalizer<Block, BE> + AuxStore
+			+ HeaderMetadata<Block, Error = sp_blockchain::Error> + HeaderBackend<Block>
+			+ BlockchainEvents<Block> + ProvideRuntimeApi<Block> + ExecutorProvider<Block>
+			+ BlockImport<Block, Transaction = TransactionFor<BE, Block>, Error = sp_consensus::Error>,
+{}
 
 /// Something that one can ask to do a block sync request.
 pub(crate) trait BlockSyncRequester<Block: BlockT> {
@@ -273,14 +351,14 @@ pub(crate) trait BlockSyncRequester<Block: BlockT> {
 	/// If the given vector of peers is empty then the underlying implementation
 	/// should make a best effort to fetch the block from any peers it is
 	/// connected to (NOTE: this assumption will change in the future #3629).
-	fn set_sync_fork_request(&self, peers: Vec<network::PeerId>, hash: Block::Hash, number: NumberFor<Block>);
+	fn set_sync_fork_request(&self, peers: Vec<sc_network::PeerId>, hash: Block::Hash, number: NumberFor<Block>);
 }
 
-impl<Block, N> BlockSyncRequester<Block> for NetworkBridge<Block, N> where
+impl<Block, Network> BlockSyncRequester<Block> for NetworkBridge<Block, Network> where
 	Block: BlockT,
-	N: communication::Network<Block>,
+	Network: NetworkT<Block>,
 {
-	fn set_sync_fork_request(&self, peers: Vec<network::PeerId>, hash: Block::Hash, number: NumberFor<Block>) {
+	fn set_sync_fork_request(&self, peers: Vec<sc_network::PeerId>, hash: Block::Hash, number: NumberFor<Block>) {
 		NetworkBridge::set_sync_fork_request(self, peers, hash, number)
 	}
 }
@@ -333,8 +411,8 @@ impl<H, N> From<ClientError> for CommandOrError<H, N> {
 	}
 }
 
-impl<H, N> From<grandpa::Error> for CommandOrError<H, N> {
-	fn from(e: grandpa::Error) -> Self {
+impl<H, N> From<finality_grandpa::Error> for CommandOrError<H, N> {
+	fn from(e: finality_grandpa::Error) -> Self {
 		CommandOrError::Error(Error::from(e))
 	}
 }
@@ -356,11 +434,19 @@ impl<H, N> fmt::Display for CommandOrError<H, N> {
 	}
 }
 
-pub struct LinkHalf<B, E, Block: BlockT<Hash=H256>, RA, SC> {
-	client: Arc<Client<B, E, Block, RA>>,
+/// Link between the block importer and the background voter.
+pub struct LinkHalf<Block: BlockT, C, SC> {
+	client: Arc<C>,
 	select_chain: SC,
 	persistent_data: PersistentData<Block>,
-	voter_commands_rx: mpsc::UnboundedReceiver<VoterCommand<Block::Hash, NumberFor<Block>>>,
+	voter_commands_rx: TracingUnboundedReceiver<VoterCommand<Block::Hash, NumberFor<Block>>>,
+}
+
+impl<Block: BlockT, C, SC> LinkHalf<Block, C, SC> {
+	/// Get the shared authority set.
+	pub fn shared_authority_set(&self) -> &SharedAuthoritySet<Block::Hash, NumberFor<Block>> {
+		&self.persistent_data.authority_set
+	}
 }
 
 /// Provider for the Grandpa authority set configured on the genesis block.
@@ -369,11 +455,8 @@ pub trait GenesisAuthoritySetProvider<Block: BlockT> {
 	fn get(&self) -> Result<AuthorityList, ClientError>;
 }
 
-impl<B, E, Block: BlockT<Hash=H256>, RA> GenesisAuthoritySetProvider<Block> for Client<B, E, Block, RA>
-	where
-		B: Backend<Block, Blake2Hasher> + Send + Sync + 'static,
-		E: CallExecutor<Block, Blake2Hasher> + 'static + Clone + Send + Sync,
-		RA: Send + Sync,
+impl<Block: BlockT, E> GenesisAuthoritySetProvider<Block> for Arc<dyn ExecutorProvider<Block, Executor = E>>
+	where E: CallExecutor<Block>,
 {
 	fn get(&self) -> Result<AuthorityList, ClientError> {
 		// This implementation uses the Grandpa runtime API instead of reading directly from the
@@ -390,7 +473,7 @@ impl<B, E, Block: BlockT<Hash=H256>, RA> GenesisAuthoritySetProvider<Block> for 
 			.and_then(|call_result| {
 				Decode::decode(&mut &call_result[..])
 					.map_err(|err| ClientError::CallResultDecode(
-						"failed to decode GRANDPA authorities set proof".into(), err
+						"failed to decode GRANDPA authorities set proof", err
 					))
 			})
 	}
@@ -398,22 +481,54 @@ impl<B, E, Block: BlockT<Hash=H256>, RA> GenesisAuthoritySetProvider<Block> for 
 
 /// Make block importer and link half necessary to tie the background voter
 /// to it.
-pub fn block_import<B, E, Block: BlockT<Hash=H256>, RA, SC>(
-	client: Arc<Client<B, E, Block, RA>>,
+pub fn block_import<BE, Block: BlockT, Client, SC>(
+	client: Arc<Client>,
 	genesis_authorities_provider: &dyn GenesisAuthoritySetProvider<Block>,
 	select_chain: SC,
-) -> Result<(
-		GrandpaBlockImport<B, E, Block, RA, SC>,
-		LinkHalf<B, E, Block, RA, SC>
-	), ClientError>
+) -> Result<
+	(
+		GrandpaBlockImport<BE, Block, Client, SC>,
+		LinkHalf<Block, Client, SC>,
+	),
+	ClientError,
+>
 where
-	B: Backend<Block, Blake2Hasher> + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + 'static + Clone + Send + Sync,
-	RA: Send + Sync,
 	SC: SelectChain<Block>,
+	BE: Backend<Block> + 'static,
+	Client: ClientForGrandpa<Block, BE> + 'static,
+{
+	block_import_with_authority_set_hard_forks(
+		client,
+		genesis_authorities_provider,
+		select_chain,
+		Default::default(),
+	)
+}
+
+/// Make block importer and link half necessary to tie the background voter to
+/// it. A vector of authority set hard forks can be passed, any authority set
+/// change signaled at the given block (either already signalled or in a further
+/// block when importing it) will be replaced by a standard change with the
+/// given static authorities.
+pub fn block_import_with_authority_set_hard_forks<BE, Block: BlockT, Client, SC>(
+	client: Arc<Client>,
+	genesis_authorities_provider: &dyn GenesisAuthoritySetProvider<Block>,
+	select_chain: SC,
+	authority_set_hard_forks: Vec<(SetId, (Block::Hash, NumberFor<Block>), AuthorityList)>,
+) -> Result<
+	(
+		GrandpaBlockImport<BE, Block, Client, SC>,
+		LinkHalf<Block, Client, SC>,
+	),
+	ClientError,
+>
+where
+	SC: SelectChain<Block>,
+	BE: Backend<Block> + 'static,
+	Client: ClientForGrandpa<Block, BE> + 'static,
 {
 	let chain_info = client.info();
-	let genesis_hash = chain_info.chain.genesis_hash;
+	let genesis_hash = chain_info.genesis_hash;
 
 	let persistent_data = aux_schema::load_persistent(
 		&*client,
@@ -428,7 +543,25 @@ where
 		}
 	)?;
 
-	let (voter_commands_tx, voter_commands_rx) = mpsc::unbounded();
+	let (voter_commands_tx, voter_commands_rx) = tracing_unbounded("mpsc_grandpa_voter_command");
+
+	// create pending change objects with 0 delay and enacted on finality
+	// (i.e. standard changes) for each authority set hard fork.
+	let authority_set_hard_forks = authority_set_hard_forks
+		.into_iter()
+		.map(|(set_id, (hash, number), authorities)| {
+			(
+				set_id,
+				authorities::PendingChange {
+					next_authorities: authorities,
+					delay: Zero::zero(),
+					canon_hash: hash,
+					canon_height: number,
+					delay_kind: authorities::DelayKind::Finalized,
+				},
+			)
+		})
+		.collect();
 
 	Ok((
 		GrandpaBlockImport::new(
@@ -437,6 +570,7 @@ where
 			persistent_data.authority_set.clone(),
 			voter_commands_tx,
 			persistent_data.consensus_changes.clone(),
+			authority_set_hard_forks,
 		),
 		LinkHalf {
 			client,
@@ -447,26 +581,25 @@ where
 	))
 }
 
-fn global_communication<Block: BlockT<Hash=H256>, B, E, N, RA>(
+fn global_communication<BE, Block: BlockT, C, N>(
 	set_id: SetId,
 	voters: &Arc<VoterSet<AuthorityId>>,
-	client: &Arc<Client<B, E, Block, RA>>,
+	client: Arc<C>,
 	network: &NetworkBridge<Block, N>,
 	keystore: &Option<KeyStorePtr>,
+	metrics: Option<until_imported::Metrics>,
 ) -> (
 	impl Stream<
-		Item = CommunicationInH<Block, H256>,
-		Error = CommandOrError<H256, NumberFor<Block>>,
+		Item = Result<CommunicationInH<Block, Block::Hash>, CommandOrError<Block::Hash, NumberFor<Block>>>,
 	>,
 	impl Sink<
-		SinkItem = CommunicationOutH<Block, H256>,
-		SinkError = CommandOrError<H256, NumberFor<Block>>,
-	>,
+		CommunicationOutH<Block, Block::Hash>,
+		Error = CommandOrError<Block::Hash, NumberFor<Block>>,
+	> + Unpin,
 ) where
-	B: Backend<Block, Blake2Hasher>,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync,
-	N: Network<Block>,
-	RA: Send + Sync,
+	BE: Backend<Block> + 'static,
+	C: ClientForGrandpa<Block, BE> + 'static,
+	N: NetworkT<Block>,
 	NumberFor<Block>: BlockNumberOps,
 {
 	let is_voter = is_voter(voters, keystore).is_some();
@@ -485,6 +618,7 @@ fn global_communication<Block: BlockT<Hash=H256>, B, E, N, RA>(
 		client.clone(),
 		global_in,
 		"global",
+		metrics,
 	);
 
 	let global_in = global_in.map_err(CommandOrError::from);
@@ -495,20 +629,18 @@ fn global_communication<Block: BlockT<Hash=H256>, B, E, N, RA>(
 
 /// Register the finality tracker inherent data provider (which is used by
 /// GRANDPA), if not registered already.
-fn register_finality_tracker_inherent_data_provider<B, E, Block: BlockT<Hash=H256>, RA>(
-	client: Arc<Client<B, E, Block, RA>>,
+fn register_finality_tracker_inherent_data_provider<Block: BlockT, Client>(
+	client: Arc<Client>,
 	inherent_data_providers: &InherentDataProviders,
-) -> Result<(), consensus_common::Error> where
-	B: Backend<Block, Blake2Hasher> + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	RA: Send + Sync + 'static,
+) -> Result<(), sp_consensus::Error> where
+	Client: HeaderBackend<Block> + 'static,
 {
 	if !inherent_data_providers.has_provider(&sp_finality_tracker::INHERENT_IDENTIFIER) {
 		inherent_data_providers
 			.register_provider(sp_finality_tracker::InherentDataProvider::new(move || {
 				#[allow(deprecated)]
 				{
-					let info = client.info().chain;
+					let info = client.info();
 					telemetry!(CONSENSUS_INFO; "afg.finalized";
 						"finalized_number" => ?info.finalized_number,
 						"finalized_hash" => ?info.finalized_hash,
@@ -516,56 +648,63 @@ fn register_finality_tracker_inherent_data_provider<B, E, Block: BlockT<Hash=H25
 					Ok(info.finalized_number)
 				}
 			}))
-			.map_err(|err| consensus_common::Error::InherentData(err.into()))
+			.map_err(|err| sp_consensus::Error::InherentData(err))
 	} else {
 		Ok(())
 	}
 }
 
 /// Parameters used to run Grandpa.
-pub struct GrandpaParams<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X> {
+pub struct GrandpaParams<Block: BlockT, C, N, SC, VR> {
 	/// Configuration for the GRANDPA service.
 	pub config: Config,
 	/// A link to the block import worker.
-	pub link: LinkHalf<B, E, Block, RA, SC>,
+	pub link: LinkHalf<Block, C, SC>,
 	/// The Network instance.
 	pub network: N,
 	/// The inherent data providers.
 	pub inherent_data_providers: InherentDataProviders,
-	/// Handle to a future that will resolve on exit.
-	pub on_exit: X,
 	/// If supplied, can be used to hook on telemetry connection established events.
-	pub telemetry_on_connect: Option<mpsc::UnboundedReceiver<()>>,
+	pub telemetry_on_connect: Option<TracingUnboundedReceiver<()>>,
 	/// A voting rule used to potentially restrict target votes.
 	pub voting_rule: VR,
+	/// The prometheus metrics registry.
+	pub prometheus_registry: Option<prometheus_endpoint::Registry>,
+	/// The voter state is exposed at an RPC endpoint.
+	pub shared_voter_state: SharedVoterState,
 }
 
 /// Run a GRANDPA voter as a task. Provide configuration and a link to a
 /// block import worker that has already been instantiated with `block_import`.
-pub fn run_grandpa_voter<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X>(
-	grandpa_params: GrandpaParams<B, E, Block, N, RA, SC, VR, X>,
-) -> sp_blockchain::Result<impl Future<Item=(),Error=()> + Send + 'static> where
+pub fn run_grandpa_voter<Block: BlockT, BE: 'static, C, N, SC, VR>(
+	grandpa_params: GrandpaParams<Block, C, N, SC, VR>,
+) -> sp_blockchain::Result<impl Future<Output = ()> + Unpin + Send + 'static> where
 	Block::Hash: Ord,
-	B: Backend<Block, Blake2Hasher> + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	N: Network<Block> + Send + Sync + 'static,
-	N::In: Send + 'static,
+	BE: Backend<Block> + 'static,
+	N: NetworkT<Block> + Send + Sync + Clone + 'static,
 	SC: SelectChain<Block> + 'static,
-	VR: VotingRule<Block, Client<B, E, Block, RA>> + Clone + 'static,
+	VR: VotingRule<Block, C> + Clone + 'static,
 	NumberFor<Block>: BlockNumberOps,
 	DigestFor<Block>: Encode,
-	RA: Send + Sync + 'static,
-	X: Future<Item=(),Error=()> + Clone + Send + 'static,
+	C: ClientForGrandpa<Block, BE> + 'static,
+	C::Api: GrandpaApi<Block, Error = sp_blockchain::Error>,
 {
 	let GrandpaParams {
-		config,
+		mut config,
 		link,
 		network,
 		inherent_data_providers,
-		on_exit,
 		telemetry_on_connect,
 		voting_rule,
+		prometheus_registry,
+		shared_voter_state,
 	} = grandpa_params;
+
+	// NOTE: we have recently removed `run_grandpa_observer` from the public
+	// API, I felt it is easier to just ignore this field rather than removing
+	// it from the config temporarily. This should be removed after #5013 is
+	// fixed and we re-add the observer to the public API.
+	config.observer_enabled = false;
 
 	let LinkHalf {
 		client,
@@ -574,11 +713,11 @@ pub fn run_grandpa_voter<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X>(
 		voter_commands_rx,
 	} = link;
 
-	let (network, network_startup) = NetworkBridge::new(
+	let network = NetworkBridge::new(
 		network,
 		config.clone(),
 		persistent_data.set_state.clone(),
-		on_exit.clone(),
+		prometheus_registry.as_ref(),
 	);
 
 	register_finality_tracker_inherent_data_provider(client.clone(), &inherent_data_providers)?;
@@ -589,26 +728,25 @@ pub fn run_grandpa_voter<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X>(
 		let events = telemetry_on_connect
 			.for_each(move |_| {
 				let curr = authorities.current_authorities();
-				let mut auths = curr.voters().into_iter().map(|(p, _)| p);
+				let mut auths = curr.iter().map(|(p, _)| p);
 				let maybe_authority_id = authority_id(&mut auths, &conf.keystore)
-					.unwrap_or(Default::default());
+					.unwrap_or_default();
 
 				telemetry!(CONSENSUS_INFO; "afg.authority_set";
 					"authority_id" => maybe_authority_id.to_string(),
 					"authority_set_id" => ?authorities.set_id(),
 					"authorities" => {
-						let authorities: Vec<String> = curr.voters()
-							.iter().map(|(id, _)| id.to_string()).collect();
+						let authorities: Vec<String> = curr.iter()
+							.map(|(id, _)| id.to_string()).collect();
 						serde_json::to_string(&authorities)
 							.expect("authorities is always at least an empty vector; elements are always of type string")
 					}
 				);
-				Ok(())
-			})
-			.then(|_| -> Result<(), ()> { Ok(()) });
-		futures::future::Either::A(events)
+				future::ready(())
+			});
+		future::Either::Left(events)
 	} else {
-		futures::future::Either::B(futures::future::empty())
+		future::Either::Right(future::pending())
 	};
 
 	let voter_work = VoterWork::new(
@@ -619,53 +757,77 @@ pub fn run_grandpa_voter<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X>(
 		voting_rule,
 		persistent_data,
 		voter_commands_rx,
+		prometheus_registry,
+		shared_voter_state,
 	);
 
 	let voter_work = voter_work
-		.map(|_| ())
-		.map_err(|e| {
-			error!("GRANDPA Voter failed: {:?}", e);
-			telemetry!(CONSENSUS_WARN; "afg.voter_failed"; "e" => ?e);
-		});
-
-	let voter_work = network_startup.and_then(move |()| voter_work);
+		.map(|_| ());
 
 	// Make sure that `telemetry_task` doesn't accidentally finish and kill grandpa.
 	let telemetry_task = telemetry_task
-		.then(|_| futures::future::empty::<(), ()>());
+		.then(|_| future::pending::<()>());
 
-	Ok(voter_work.select(on_exit).select2(telemetry_task).then(|_| Ok(())))
+	Ok(future::select(voter_work, telemetry_task).map(drop))
+}
+
+struct Metrics {
+	environment: environment::Metrics,
+	until_imported: until_imported::Metrics,
+}
+
+impl Metrics {
+	fn register(registry: &Registry) -> Result<Self, PrometheusError> {
+		Ok(Metrics {
+			environment: environment::Metrics::register(registry)?,
+			until_imported: until_imported::Metrics::register(registry)?,
+		})
+	}
 }
 
 /// Future that powers the voter.
 #[must_use]
-struct VoterWork<B, E, Block: BlockT, N: Network<Block>, RA, SC, VR> {
-	voter: Box<dyn Future<Item = (), Error = CommandOrError<Block::Hash, NumberFor<Block>>> + Send>,
-	env: Arc<Environment<B, E, Block, N, RA, SC, VR>>,
-	voter_commands_rx: mpsc::UnboundedReceiver<VoterCommand<Block::Hash, NumberFor<Block>>>,
+struct VoterWork<B, Block: BlockT, C, N: NetworkT<Block>, SC, VR> {
+	voter: Pin<Box<dyn Future<Output = Result<(), CommandOrError<Block::Hash, NumberFor<Block>>>> + Send>>,
+	shared_voter_state: SharedVoterState,
+	env: Arc<Environment<B, Block, C, N, SC, VR>>,
+	voter_commands_rx: TracingUnboundedReceiver<VoterCommand<Block::Hash, NumberFor<Block>>>,
+	network: NetworkBridge<Block, N>,
+
+	/// Prometheus metrics.
+	metrics: Option<Metrics>,
 }
 
-impl<B, E, Block, N, RA, SC, VR> VoterWork<B, E, Block, N, RA, SC, VR>
+impl<B, Block, C, N, SC, VR> VoterWork<B, Block, C, N, SC, VR>
 where
-	Block: BlockT<Hash=H256>,
-	N: Network<Block> + Sync,
-	N::In: Send + 'static,
+	Block: BlockT,
+	B: Backend<Block> + 'static,
+	C: ClientForGrandpa<Block, B> + 'static,
+	C::Api: GrandpaApi<Block, Error = sp_blockchain::Error>,
+	N: NetworkT<Block> + Sync,
 	NumberFor<Block>: BlockNumberOps,
-	RA: 'static + Send + Sync,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	B: Backend<Block, Blake2Hasher> + 'static,
 	SC: SelectChain<Block> + 'static,
-	VR: VotingRule<Block, Client<B, E, Block, RA>> + Clone + 'static,
+	VR: VotingRule<Block, C> + Clone + 'static,
 {
 	fn new(
-		client: Arc<Client<B, E, Block, RA>>,
+		client: Arc<C>,
 		config: Config,
 		network: NetworkBridge<Block, N>,
 		select_chain: SC,
 		voting_rule: VR,
 		persistent_data: PersistentData<Block>,
-		voter_commands_rx: mpsc::UnboundedReceiver<VoterCommand<Block::Hash, NumberFor<Block>>>,
+		voter_commands_rx: TracingUnboundedReceiver<VoterCommand<Block::Hash, NumberFor<Block>>>,
+		prometheus_registry: Option<prometheus_endpoint::Registry>,
+		shared_voter_state: SharedVoterState,
 	) -> Self {
+		let metrics = match prometheus_registry.as_ref().map(Metrics::register) {
+			Some(Ok(metrics)) => Some(metrics),
+			Some(Err(e)) => {
+				debug!(target: "afg", "Failed to register metrics: {:?}", e);
+				None
+			}
+			None => None,
+		};
 
 		let voters = persistent_data.authority_set.current_authorities();
 		let env = Arc::new(Environment {
@@ -674,19 +836,24 @@ where
 			voting_rule,
 			voters: Arc::new(voters),
 			config,
-			network,
+			network: network.clone(),
 			set_id: persistent_data.authority_set.set_id(),
 			authority_set: persistent_data.authority_set.clone(),
 			consensus_changes: persistent_data.consensus_changes.clone(),
-			voter_set_state: persistent_data.set_state.clone(),
+			voter_set_state: persistent_data.set_state,
+			metrics: metrics.as_ref().map(|m| m.environment.clone()),
+			_phantom: PhantomData,
 		});
 
 		let mut work = VoterWork {
 			// `voter` is set to a temporary value and replaced below when
 			// calling `rebuild_voter`.
-			voter: Box::new(futures::empty()) as Box<_>,
+			voter: Box::pin(future::pending()),
+			shared_voter_state,
 			env,
 			voter_commands_rx,
+			network,
+			metrics,
 		};
 		work.rebuild_voter();
 		work
@@ -700,7 +867,7 @@ where
 
 		let authority_id = is_voter(&self.env.voters, &self.env.config.keystore)
 			.map(|ap| ap.public())
-			.unwrap_or(Default::default());
+			.unwrap_or_default();
 
 		telemetry!(CONSENSUS_DEBUG; "afg.starting_new_voter";
 			"name" => ?self.env.config.name(),
@@ -710,12 +877,12 @@ where
 
 		let chain_info = self.env.client.info();
 		telemetry!(CONSENSUS_INFO; "afg.authority_set";
-			"number" => ?chain_info.chain.finalized_number,
-			"hash" => ?chain_info.chain.finalized_hash,
+			"number" => ?chain_info.finalized_number,
+			"hash" => ?chain_info.finalized_hash,
 			"authority_id" => authority_id.to_string(),
 			"authority_set_id" => ?self.env.set_id,
 			"authorities" => {
-				let authorities: Vec<String> = self.env.voters.voters()
+				let authorities: Vec<String> = self.env.voters
 					.iter().map(|(id, _)| id.to_string()).collect();
 				serde_json::to_string(&authorities)
 					.expect("authorities is always at least an empty vector; elements are always of type string")
@@ -725,16 +892,17 @@ where
 		match &*self.env.voter_set_state.read() {
 			VoterSetState::Live { completed_rounds, .. } => {
 				let last_finalized = (
-					chain_info.chain.finalized_hash,
-					chain_info.chain.finalized_number,
+					chain_info.finalized_hash,
+					chain_info.finalized_number,
 				);
 
 				let global_comms = global_communication(
 					self.env.set_id,
 					&self.env.voters,
-					&self.env.client,
+					self.env.client.clone(),
 					&self.env.network,
 					&self.env.config.keystore,
+					self.metrics.as_ref().map(|m| m.until_imported.clone()),
 				);
 
 				let last_completed_round = completed_rounds.last();
@@ -745,14 +913,22 @@ where
 					global_comms,
 					last_completed_round.number,
 					last_completed_round.votes.clone(),
-					last_completed_round.base.clone(),
+					last_completed_round.base,
 					last_finalized,
 				);
 
-				self.voter = Box::new(voter);
+				// Repoint shared_voter_state so that the RPC endpoint can query the state
+				if self.shared_voter_state.reset(voter.voter_state()).is_none() {
+					info!(target: "afg",
+						"Timed out trying to update shared GRANDPA voter state. \
+						RPC endpoints may return stale data."
+					);
+				}
+
+				self.voter = Box::pin(voter);
 			},
 			VoterSetState::Paused { .. } =>
-				self.voter = Box::new(futures::empty()),
+				self.voter = Box::pin(future::pending()),
 		};
 	}
 
@@ -785,11 +961,18 @@ where
 					Ok(Some(set_state))
 				})?;
 
+				let voters = Arc::new(VoterSet::new(new.authorities.into_iter())
+					.expect("new authorities come from pending change; \
+							 pending change comes from `AuthoritySet`; \
+							 `AuthoritySet` validates authorities is non-empty and weights are non-zero; \
+							 qed."
+					)
+				);
+
 				self.env = Arc::new(Environment {
-					voters: Arc::new(new.authorities.into_iter().collect()),
+					voters,
 					set_id: new.set_id,
 					voter_set_state: self.env.voter_set_state.clone(),
-					// Fields below are simply transferred and not updated.
 					client: self.env.client.clone(),
 					select_chain: self.env.select_chain.clone(),
 					config: self.env.config.clone(),
@@ -797,6 +980,8 @@ where
 					consensus_changes: self.env.consensus_changes.clone(),
 					network: self.env.network.clone(),
 					voting_rule: self.env.voting_rule.clone(),
+					metrics: self.env.metrics.clone(),
+					_phantom: PhantomData,
 				});
 
 				self.rebuild_voter();
@@ -821,77 +1006,52 @@ where
 	}
 }
 
-impl<B, E, Block, N, RA, SC, VR> Future for VoterWork<B, E, Block, N, RA, SC, VR>
+impl<B, Block, C, N, SC, VR> Future for VoterWork<B, Block, C, N, SC, VR>
 where
-	Block: BlockT<Hash=H256>,
-	N: Network<Block> + Sync,
-	N::In: Send + 'static,
+	Block: BlockT,
+	B: Backend<Block> + 'static,
+	N: NetworkT<Block> + Sync,
 	NumberFor<Block>: BlockNumberOps,
-	RA: 'static + Send + Sync,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	B: Backend<Block, Blake2Hasher> + 'static,
 	SC: SelectChain<Block> + 'static,
-	VR: VotingRule<Block, Client<B, E, Block, RA>> + Clone + 'static,
+	C: ClientForGrandpa<Block, B> + 'static,
+	C::Api: GrandpaApi<Block, Error = sp_blockchain::Error>,
+	VR: VotingRule<Block, C> + Clone + 'static,
 {
-	type Item = ();
-	type Error = Error;
+	type Output = Result<(), Error>;
 
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-		match self.voter.poll() {
-			Ok(Async::NotReady) => {}
-			Ok(Async::Ready(())) => {
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+		match Future::poll(Pin::new(&mut self.voter), cx) {
+			Poll::Pending => {}
+			Poll::Ready(Ok(())) => {
 				// voters don't conclude naturally
-				return Err(Error::Safety("GRANDPA voter has concluded.".into()))
+				return Poll::Ready(Err(Error::Safety("GRANDPA voter has concluded.".into())))
 			}
-			Err(CommandOrError::Error(e)) => {
+			Poll::Ready(Err(CommandOrError::Error(e))) => {
 				// return inner observer error
-				return Err(e)
+				return Poll::Ready(Err(e))
 			}
-			Err(CommandOrError::VoterCommand(command)) => {
+			Poll::Ready(Err(CommandOrError::VoterCommand(command))) => {
 				// some command issued internally
 				self.handle_voter_command(command)?;
-				futures::task::current().notify();
+				cx.waker().wake_by_ref();
 			}
 		}
 
-		match self.voter_commands_rx.poll() {
-			Ok(Async::NotReady) => {}
-			Err(_) => {
-				// the `voter_commands_rx` stream should not fail.
-				return Ok(Async::Ready(()))
-			}
-			Ok(Async::Ready(None)) => {
+		match Stream::poll_next(Pin::new(&mut self.voter_commands_rx), cx) {
+			Poll::Pending => {}
+			Poll::Ready(None) => {
 				// the `voter_commands_rx` stream should never conclude since it's never closed.
-				return Ok(Async::Ready(()))
+				return Poll::Ready(Ok(()))
 			}
-			Ok(Async::Ready(Some(command))) => {
+			Poll::Ready(Some(command)) => {
 				// some command issued externally
 				self.handle_voter_command(command)?;
-				futures::task::current().notify();
+				cx.waker().wake_by_ref();
 			}
 		}
 
-		Ok(Async::NotReady)
+		Future::poll(Pin::new(&mut self.network), cx)
 	}
-}
-
-#[deprecated(since = "1.1.0", note = "Please switch to run_grandpa_voter.")]
-pub fn run_grandpa<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X>(
-	grandpa_params: GrandpaParams<B, E, Block, N, RA, SC, VR, X>,
-) -> ::sp_blockchain::Result<impl Future<Item=(),Error=()> + Send + 'static> where
-	Block::Hash: Ord,
-	B: Backend<Block, Blake2Hasher> + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	N: Network<Block> + Send + Sync + 'static,
-	N::In: Send + 'static,
-	SC: SelectChain<Block> + 'static,
-	NumberFor<Block>: BlockNumberOps,
-	DigestFor<Block>: Encode,
-	RA: Send + Sync + 'static,
-	VR: VotingRule<Block, Client<B, E, Block, RA>> + Clone + 'static,
-	X: Future<Item=(),Error=()> + Clone + Send + 'static,
-{
-	run_grandpa_voter(grandpa_params)
 }
 
 /// When GRANDPA is not initialized we still need to register the finality
@@ -900,23 +1060,26 @@ pub fn run_grandpa<B, E, Block: BlockT<Hash=H256>, N, RA, SC, VR, X>(
 /// discards all GRANDPA messages (otherwise, we end up banning nodes that send
 /// us a `Neighbor` message, since there is no registered gossip validator for
 /// the engine id defined in the message.)
-pub fn setup_disabled_grandpa<B, E, Block: BlockT<Hash=H256>, RA, N>(
-	client: Arc<Client<B, E, Block, RA>>,
+pub fn setup_disabled_grandpa<Block: BlockT, Client, N>(
+	client: Arc<Client>,
 	inherent_data_providers: &InherentDataProviders,
 	network: N,
-) -> Result<(), consensus_common::Error> where
-	B: Backend<Block, Blake2Hasher> + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	RA: Send + Sync + 'static,
-	N: Network<Block> + Send + Sync + 'static,
-	N::In: Send + 'static,
+) -> Result<(), sp_consensus::Error> where
+	N: NetworkT<Block> + Send + Clone + 'static,
+	Client: HeaderBackend<Block> + 'static,
 {
 	register_finality_tracker_inherent_data_provider(
 		client,
 		inherent_data_providers,
 	)?;
 
-	network.register_validator(Arc::new(network::consensus_gossip::DiscardAll));
+	// We register the GRANDPA protocol so that we don't consider it an anomaly
+	// to receive GRANDPA messages on the network. We don't process the
+	// messages.
+	network.register_notifications_protocol(
+		communication::GRANDPA_ENGINE_ID,
+		From::from(communication::GRANDPA_PROTOCOL_NAME),
+	);
 
 	Ok(())
 }
@@ -929,7 +1092,8 @@ fn is_voter(
 	keystore: &Option<KeyStorePtr>,
 ) -> Option<AuthorityPair> {
 	match keystore {
-		Some(keystore) => voters.voters().iter()
+		Some(keystore) => voters
+			.iter()
 			.find_map(|(p, _)| keystore.read().key_pair::<AuthorityPair>(&p).ok()),
 		None => None,
 	}

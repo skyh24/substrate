@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -19,7 +19,7 @@ use quote::quote;
 use syn::{DeriveInput, Ident, Error};
 use proc_macro_crate::crate_name;
 
-const CRATE_NAME: &str = "substrate-chain-spec";
+const CRATE_NAME: &str = "sc-chain-spec";
 const ATTRIBUTE_NAME: &str = "forks";
 
 /// Implements `Extension's` `Group` accessor.
@@ -48,6 +48,15 @@ pub fn extension_derive(ast: &DeriveInput) -> proc_macro::TokenStream {
 					match TypeId::of::<T>() {
 						#( x if x == TypeId::of::<#field_types>() => Any::downcast_ref(&self.#field_names) ),*,
 						_ => None,
+					}
+				}
+
+				fn get_any(&self, t: std::any::TypeId) -> &dyn std::any::Any {
+					use std::any::{Any, TypeId};
+
+					match t {
+						#( x if x == TypeId::of::<#field_types>() => &self.#field_names ),*,
+						_ => self,
 					}
 				}
 			}
@@ -108,7 +117,7 @@ pub fn derive(
 	let err = || {
 		let err = Error::new(
 			Span::call_site(),
-			"ChainSpecGroup is only avaible for structs with named fields."
+			"ChainSpecGroup is only available for structs with named fields."
 		).to_compile_error();
 		quote!( #err ).into()
 	};

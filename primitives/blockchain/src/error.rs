@@ -1,33 +1,31 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Substrate client possible errors.
 
 use std::{self, error, result};
 use sp_state_machine;
-use sr_primitives::transaction_validity::TransactionValidityError;
-#[allow(deprecated)]
-use sp_block_builder_runtime_api::compatability_v3;
+use sp_runtime::transaction_validity::TransactionValidityError;
 use sp_consensus;
 use derive_more::{Display, From};
-use parity_scale_codec::Error as CodecError;
+use codec::Error as CodecError;
 
 /// Client Result type alias
 pub type Result<T> = result::Result<T, Error>;
-
 
 /// Error when the runtime failed to apply an extrinsic.
 #[derive(Debug, Display)]
@@ -38,7 +36,7 @@ pub enum ApplyExtrinsicFailed {
 	/// unappliable onto the current block.
 	#[display(fmt = "Extrinsic is not valid: {:?}", _0)]
 	Validity(TransactionValidityError),
-	/// This is used for miscelanious errors that can be represented by string and not handleable.
+	/// This is used for miscellaneous errors that can be represented by string and not handleable.
 	///
 	/// This will become obsolete with complete migration to v4 APIs.
 	#[display(fmt = "Extrinsic failed: {:?}", _0)]
@@ -72,8 +70,9 @@ pub enum Error {
 	#[display(fmt = "Current state of blockchain has invalid authorities set")]
 	InvalidAuthoritiesSet,
 	/// Could not get runtime version.
-	#[display(fmt = "On-chain runtime does not specify version")]
-	VersionInvalid,
+	#[display(fmt = "Failed to get runtime version: {}", _0)]
+	#[from(ignore)]
+	VersionInvalid(String),
 	/// Genesis config is invalid.
 	#[display(fmt = "Genesis config provided is invalid")]
 	GenesisInvalid,
@@ -106,6 +105,9 @@ pub enum Error {
 	/// Changes tries are not supported.
 	#[display(fmt = "Changes tries are not supported by the runtime")]
 	ChangesTriesNotSupported,
+	/// Error reading changes tries configuration.
+	#[display(fmt = "Error reading changes tries configuration")]
+	ErrorReadingChangesTriesConfig,
 	/// Key changes query has failed.
 	#[display(fmt = "Failed to check changes proof: {}", _0)]
 	#[from(ignore)]
@@ -123,9 +125,13 @@ pub enum Error {
 	/// Invalid calculated state root on block import.
 	#[display(fmt = "Calculated state root does not match.")]
 	InvalidStateRoot,
+	/// Incomplete block import pipeline.
+	#[display(fmt = "Incomplete block import pipeline.")]
+	IncompletePipeline,
+	#[display(fmt = "Transaction pool not ready for block production.")]
+	TransactionPoolNotReady,
 	/// A convenience variant for String
 	#[display(fmt = "{}", _0)]
-	#[from(ignore)]
 	Msg(String),
 }
 
@@ -139,26 +145,9 @@ impl error::Error for Error {
 	}
 }
 
-impl From<String> for Error {
-	fn from(s: String) -> Self {
-		Error::Msg(s)
-	}
-}
-
 impl<'a> From<&'a str> for Error {
 	fn from(s: &'a str) -> Self {
 		Error::Msg(s.into())
-	}
-}
-
-#[allow(deprecated)]
-impl From<compatability_v3::ApplyError> for ApplyExtrinsicFailed {
-	fn from(e: compatability_v3::ApplyError) -> Self {
-		use self::compatability_v3::ApplyError::*;
-		match e {
-			Validity(tx_validity) => Self::Validity(tx_validity),
-			e => Self::Msg(format!("Apply extrinsic failed: {:?}", e)),
-		}
 	}
 }
 

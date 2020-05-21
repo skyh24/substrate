@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -17,9 +17,9 @@
 //! Schema for slots in the aux-db.
 
 use codec::{Encode, Decode};
-use client_api::backend::AuxStore;
+use sc_client_api::backend::AuxStore;
 use sp_blockchain::{Result as ClientResult, Error as ClientError};
-use sr_primitives::traits::Header;
+use sp_runtime::traits::Header;
 
 const SLOT_HEADER_MAP_KEY: &[u8] = b"slot_header_map";
 const SLOT_HEADER_START: &[u8] = b"slot_header_start";
@@ -85,8 +85,8 @@ pub fn check_equivocation<C, H, P>(
 		P: Clone + Encode + Decode + PartialEq,
 {
 	// We don't check equivocations for old headers out of our capacity.
-	if slot_now - slot > MAX_SLOT_CAPACITY {
-		return Ok(None)
+	if slot_now.saturating_sub(slot) > MAX_SLOT_CAPACITY {
+		return Ok(None);
 	}
 
 	// Key for this slot.
@@ -102,6 +102,11 @@ pub fn check_equivocation<C, H, P>(
 	let first_saved_slot = load_decode::<_, u64>(backend, &slot_header_start[..])?
 		.unwrap_or(slot);
 
+	if slot_now < first_saved_slot {
+		// The code below assumes that slots will be visited sequentially.
+		return Ok(None);
+	}
+
 	for (prev_header, prev_signer) in headers_with_sig.iter() {
 		// A proof of equivocation consists of two headers:
 		// 1) signed by the same voter,
@@ -114,7 +119,7 @@ pub fn check_equivocation<C, H, P>(
 					snd_header: header.clone(),
 				}));
 			} else {
-				//  We don't need to continue in case of duplicated header,
+				// We don't need to continue in case of duplicated header,
 				// since it's already saved and a possible equivocation
 				// would have been detected before.
 				return Ok(None)
@@ -151,10 +156,10 @@ pub fn check_equivocation<C, H, P>(
 
 #[cfg(test)]
 mod test {
-	use primitives::{sr25519, Pair};
-	use primitives::hash::H256;
-	use sr_primitives::testing::{Header as HeaderTest, Digest as DigestTest};
-	use test_client;
+	use sp_core::{sr25519, Pair};
+	use sp_core::hash::H256;
+	use sp_runtime::testing::{Header as HeaderTest, Digest as DigestTest};
+	use substrate_test_runtime_client;
 
 	use super::{MAX_SLOT_CAPACITY, PRUNING_BOUND, check_equivocation};
 
@@ -175,7 +180,7 @@ mod test {
 
 	#[test]
 	fn check_equivocation_works() {
-		let client = test_client::new();
+		let client = substrate_test_runtime_client::new();
 		let (pair, _seed) = sr25519::Pair::generate();
 		let public = pair.public();
 

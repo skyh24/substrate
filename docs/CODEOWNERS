@@ -20,14 +20,22 @@
 
 # Wasm execution and the wasm side of Substrate Runtime Interface
 /client/executor/ @pepyakin
-/primitives/sr-io/ @pepyakin
+/primitives/io/ @pepyakin @NikVolf
+
+# Crypto, execution extensions, etc.
+/primitives/core/ @NikVolf
+
+# Block production
+/primitives/authorship/ @NikVolf
+/client/basic-authorship/ @NikVolf
 
 # Sandboxing capability of Substrate Runtime
 /primitives/sr-sandbox/ @pepyakin
 /primitives/core/src/sandbox.rs @pepyakin
 
 # Transaction pool
-/client/transaction-pool/ @tomusdrw
+/client/transaction-pool/ @NikVolf
+/primitives/transaction-pool/ @NikVolf
 
 # Offchain
 /client/offchain/ @tomusdrw
@@ -41,27 +49,45 @@
 
 # GRANDPA, BABE, consensus stuff
 /frame/babe/ @andresilva @DemiMarie-parity
-/frame/grandpa/ @andresilva @DemiMarie-parity
-/client/finality-grandpa/ @andresilva @DemiMarie-parity
+/frame/grandpa/ @andresilva
+/client/finality-grandpa/ @andresilva
 /client/consensus/babe/ @andresilva @DemiMarie-parity
 /client/consensus/slots/ @andresilva @DemiMarie-parity
+/client/consensus/pow/ @sorpaas
+/primitives/consensus/pow/ @sorpaas
 
 # Contracts
-/frame/contracts/ @pepyakin @thiolliere @jimpo
+/frame/contracts/ @pepyakin
 /frame/contracts/src/wasm/runtime.rs @Robbepop
 
-# Inflation points
-/frame/staking/src/inflation.rs @thiolliere
+# EVM
+/frame/evm/ @sorpaas
 
-# NPoS and Governance
+# NPoS and Governance and Phragmén
 /frame/staking/ @kianenigma
-/frame/election/ @kianenigma
+/frame/elections/ @kianenigma
+/frame/elections-phragmen/ @kianenigma
+/primitives/phragmen/ @kianenigma
+
+# Fixed point arithmetic
+/primitives/sp-arithmetic/ @kianenigma
 
 # End to end testing of substrate node
 /bin/node/executor/ @kianenigma
 
 # Transaction weight stuff
-/primitives/sr-primitives/src/weights.rs @kianenigma
+/frame/support/src/weights.rs @kianenigma
 
 # Support crates
-/frame/support/ @thiolliere @kianenigma
+/frame/support/ @kianenigma
+
+# Authority discovery
+/client/authority-discovery/ @mxinden
+/frame/authority-discovery/ @mxinden
+
+# Prometheus endpoint
+/utils/prometheus/ @mxinden
+
+# CLI API
+/client/cli @cecton
+/client/cli-derive @cecton

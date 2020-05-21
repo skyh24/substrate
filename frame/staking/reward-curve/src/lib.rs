@@ -1,4 +1,21 @@
-extern crate proc_macro;
+// This file is part of Substrate.
+
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Proc macro to generate the reward curve functions and tests.
 
 mod log;
 
@@ -27,7 +44,7 @@ use syn::parse::{Parse, ParseStream};
 ///   Expressed in millionth, must be between 0_100_000 and 0_900_000.
 ///
 /// - `falloff`: Known as `decay_rate` in the literature. A co-efficient dictating the strength of
-///   the global incentivisation to get the `ideal_stake`. A higher number results in less typical
+///   the global incentivization to get the `ideal_stake`. A higher number results in less typical
 ///   inflation at the cost of greater volatility for validators.
 ///   Expressed in millionth, must be between 0 and 1_000_000.
 ///
@@ -42,7 +59,7 @@ use syn::parse::{Parse, ParseStream};
 ///
 /// ```
 /// # fn main() {}
-/// use sr_primitives::curve::PiecewiseLinear;
+/// use sp_runtime::curve::PiecewiseLinear;
 ///
 /// pallet_staking_reward_curve::build! {
 /// 	const I_NPOS: PiecewiseLinear<'static> = curve!(
@@ -64,10 +81,10 @@ pub fn build(input: TokenStream) -> TokenStream {
 	let declaration = generate_piecewise_linear(points);
 	let test_module = generate_test_module(&input);
 
-	let imports = match crate_name("sr-primitives") {
-		Ok(sr_primitives) => {
-			let ident = syn::Ident::new(&sr_primitives, Span::call_site());
-			quote!( extern crate #ident as _sr_primitives; )
+	let imports = match crate_name("sp-runtime") {
+		Ok(sp_runtime) => {
+			let ident = syn::Ident::new(&sp_runtime, Span::call_site());
+			quote!( extern crate #ident as _sp_runtime; )
 		},
 		Err(e) => syn::Error::new(Span::call_site(), &e).to_compile_error(),
 	};
@@ -252,10 +269,14 @@ impl INPoS {
 		}
 	}
 
+	// calculates x from:
+	// y = i_0 + (i_ideal * x_ideal - i_0) * 2^((x_ideal - x)/d)
+	// See web3 docs for the details
 	fn compute_opposite_after_x_ideal(&self, y: u32) -> u32 {
 		if y == self.i_0 {
 			return u32::max_value();
 		}
+		// Note: the log term calculated here represents a per_million value
 		let log = log2(self.i_ideal_times_x_ideal - self.i_0, y - self.i_0);
 
 		let term: u32 = ((self.d as u64 * log as u64) / 1_000_000).try_into().unwrap();
@@ -271,7 +292,7 @@ fn compute_points(input: &INposInput) -> Vec<(u32, u32)> {
 	points.push((0, inpos.i_0));
 	points.push((inpos.x_ideal, inpos.i_ideal_times_x_ideal));
 
-	// For each point p: (next_p.0 - p.0) < segment_lenght && (next_p.1 - p.1) < segment_lenght.
+	// For each point p: (next_p.0 - p.0) < segment_length && (next_p.1 - p.1) < segment_length.
 	// This ensures that the total number of segment doesn't overflow max_piece_count.
 	let max_length = (input.max_inflation - input.min_inflation + 1_000_000 - inpos.x_ideal)
 		/ (input.max_piece_count - 1);
@@ -345,16 +366,16 @@ fn generate_piecewise_linear(points: Vec<(u32, u32)>) -> TokenStream2 {
 
 		points_tokens.extend(quote!(
 			(
-				_sr_primitives::Perbill::from_parts(#x_perbill),
-				_sr_primitives::Perbill::from_parts(#y_perbill),
+				_sp_runtime::Perbill::from_parts(#x_perbill),
+				_sp_runtime::Perbill::from_parts(#y_perbill),
 			),
 		));
 	}
 
 	quote!(
-		_sr_primitives::curve::PiecewiseLinear::<'static> {
+		_sp_runtime::curve::PiecewiseLinear::<'static> {
 			points: & [ #points_tokens ],
-			maximum: _sr_primitives::Perbill::from_parts(#max),
+			maximum: _sp_runtime::Perbill::from_parts(#max),
 		}
 	)
 }
@@ -386,7 +407,7 @@ fn generate_test_module(input: &INposInput) -> TokenStream2 {
 
 			#[test]
 			fn reward_curve_precision() {
-				for &base in [MILLION, u32::max_value()].into_iter() {
+				for &base in [MILLION, u32::max_value()].iter() {
 					let number_of_check = 100_000.min(base);
 					for check_index in 0..=number_of_check {
 						let i = (check_index as u64 * base as u64 / number_of_check as u64) as u32;

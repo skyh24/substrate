@@ -1,18 +1,20 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Initialization errors.
 
@@ -27,7 +29,7 @@ pub enum Error {
 	/// Cli error
 	Cli(clap::Error),
 	/// Service error
-	Service(service::Error),
+	Service(sc_service::Error),
 	/// Client error
 	Client(sp_blockchain::Error),
 	/// Input error
@@ -46,6 +48,12 @@ pub enum Error {
 impl std::convert::From<String> for Error {
 	fn from(s: String) -> Error {
 		Error::Input(s)
+	}
+}
+
+impl std::convert::From<&str> for Error {
+	fn from(s: &str) -> Error {
+		Error::Input(s.to_string())
 	}
 }
 

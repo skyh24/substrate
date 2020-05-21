@@ -1,53 +1,82 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Peer Set Manager (PSM). Contains the strategy for choosing which nodes the network should be
 //! connected to.
 
 mod peersstate;
 
-use std::{collections::{HashSet, HashMap}, collections::VecDeque, time::Instant};
-use futures::{prelude::*, channel::mpsc};
-use libp2p::PeerId;
+use std::{collections::{HashSet, HashMap}, collections::VecDeque};
+use futures::prelude::*;
 use log::{debug, error, trace};
 use serde_json::json;
-use std::{pin::Pin, task::Context, task::Poll};
+use std::{pin::Pin, task::{Context, Poll}, time::Duration};
+use wasm_timer::Instant;
+use sp_utils::mpsc::{tracing_unbounded, TracingUnboundedSender, TracingUnboundedReceiver};
+
+pub use libp2p::PeerId;
 
 /// We don't accept nodes whose reputation is under this value.
 const BANNED_THRESHOLD: i32 = 82 * (i32::min_value() / 100);
 /// Reputation change for a node when we get disconnected from it.
-const DISCONNECT_REPUTATION_CHANGE: i32 = -10;
+const DISCONNECT_REPUTATION_CHANGE: i32 = -256;
 /// Reserved peers group ID
 const RESERVED_NODES: &'static str = "reserved";
+/// Amount of time between the moment we disconnect from a node and the moment we remove it from
+/// the list.
+const FORGET_AFTER: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
 enum Action {
 	AddReservedPeer(PeerId),
 	RemoveReservedPeer(PeerId),
 	SetReservedOnly(bool),
-	ReportPeer(PeerId, i32),
+	ReportPeer(PeerId, ReputationChange),
 	SetPriorityGroup(String, HashSet<PeerId>),
 	AddToPriorityGroup(String, PeerId),
 	RemoveFromPriorityGroup(String, PeerId),
 }
 
+/// Description of a reputation adjustment for a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReputationChange {
+	/// Reputation delta.
+	pub value: i32,
+	/// Reason for reputation change.
+	pub reason: &'static str,
+}
+
+impl ReputationChange {
+	/// New reputation change with given delta and reason.
+	pub const fn new(value: i32, reason: &'static str) -> ReputationChange {
+		ReputationChange { value, reason }
+	}
+
+	/// New reputation change that forces minimum possible reputation.
+	pub const fn new_fatal(reason: &'static str) -> ReputationChange {
+		ReputationChange { value: i32::min_value(), reason }
+	}
+}
+
 /// Shared handle to the peer set manager (PSM). Distributed around the code.
 #[derive(Debug, Clone)]
 pub struct PeersetHandle {
-	tx: mpsc::UnboundedSender<Action>,
+	tx: TracingUnboundedSender<Action>,
 }
 
 impl PeersetHandle {
@@ -75,7 +104,7 @@ impl PeersetHandle {
 	}
 
 	/// Reports an adjustment to the reputation of the given peer.
-	pub fn report_peer(&self, peer_id: PeerId, score_diff: i32) {
+	pub fn report_peer(&self, peer_id: PeerId, score_diff: ReputationChange) {
 		let _ = self.tx.unbounded_send(Action::ReportPeer(peer_id, score_diff));
 	}
 
@@ -137,14 +166,14 @@ pub struct PeersetConfig {
 	/// >			otherwise it will not be able to connect to them.
 	pub bootnodes: Vec<PeerId>,
 
-	/// If true, we only accept reserved nodes.
+	/// If true, we only accept nodes in [`PeersetConfig::priority_groups`].
 	pub reserved_only: bool,
 
-	/// List of nodes that we should always be connected to.
+	/// Lists of nodes we should always be connected to.
 	///
 	/// > **Note**: Keep in mind that the networking has to know an address for these nodes,
 	/// >			otherwise it will not be able to connect to them.
-	pub reserved_nodes: Vec<PeerId>,
+	pub priority_groups: Vec<(String, HashSet<PeerId>)>,
 }
 
 /// Side of the peer set manager owned by the network. In other words, the "receiving" side.
@@ -157,9 +186,9 @@ pub struct Peerset {
 	/// If true, we only accept reserved nodes.
 	reserved_only: bool,
 	/// Receiver for messages from the `PeersetHandle` and from `tx`.
-	rx: mpsc::UnboundedReceiver<Action>,
+	rx: TracingUnboundedReceiver<Action>,
 	/// Sending side of `rx`.
-	tx: mpsc::UnboundedSender<Action>,
+	tx: TracingUnboundedSender<Action>,
 	/// Queue of messages to be emitted when the `Peerset` is polled.
 	message_queue: VecDeque<Message>,
 	/// When the `Peerset` was created.
@@ -171,11 +200,13 @@ pub struct Peerset {
 impl Peerset {
 	/// Builds a new peerset from the given configuration.
 	pub fn from_config(config: PeersetConfig) -> (Peerset, PeersetHandle) {
-		let (tx, rx) = mpsc::unbounded();
+		let (tx, rx) = tracing_unbounded("mpsc_peerset_messages");
 
 		let handle = PeersetHandle {
 			tx: tx.clone(),
 		};
+
+		let now = Instant::now();
 
 		let mut peerset = Peerset {
 			data: peersstate::PeersState::new(config.in_peers, config.out_peers, config.reserved_only),
@@ -183,11 +214,14 @@ impl Peerset {
 			rx,
 			reserved_only: config.reserved_only,
 			message_queue: VecDeque::new(),
-			created: Instant::now(),
-			latest_time_update: Instant::now(),
+			created: now,
+			latest_time_update: now,
 		};
 
-		peerset.data.set_priority_group(RESERVED_NODES, config.reserved_nodes.into_iter().collect());
+		for (group, nodes) in config.priority_groups {
+			peerset.data.set_priority_group(&group, nodes);
+		}
+
 		for peer_id in config.bootnodes {
 			if let peersstate::Peer::Unknown(entry) = peerset.data.peer(&peer_id) {
 				entry.discover();
@@ -258,30 +292,38 @@ impl Peerset {
 		self.alloc_slots();
 	}
 
-	fn on_report_peer(&mut self, peer_id: PeerId, score_diff: i32) {
+	fn on_report_peer(&mut self, peer_id: PeerId, change: ReputationChange) {
 		// We want reputations to be up-to-date before adjusting them.
 		self.update_time();
 
 		match self.data.peer(&peer_id) {
 			peersstate::Peer::Connected(mut peer) => {
-				peer.add_reputation(score_diff);
+				peer.add_reputation(change.value);
 				if peer.reputation() < BANNED_THRESHOLD {
+					debug!(target: "peerset", "Report {}: {:+} to {}. Reason: {}, Disconnecting",
+						peer_id, change.value, peer.reputation(), change.reason
+					);
 					peer.disconnect();
 					self.message_queue.push_back(Message::Drop(peer_id));
+				} else {
+					trace!(target: "peerset", "Report {}: {:+} to {}. Reason: {}",
+						peer_id, change.value, peer.reputation(), change.reason
+					);
 				}
 			},
-			peersstate::Peer::NotConnected(mut peer) => peer.add_reputation(score_diff),
-			peersstate::Peer::Unknown(peer) => peer.discover().add_reputation(score_diff),
+			peersstate::Peer::NotConnected(mut peer) => peer.add_reputation(change.value),
+			peersstate::Peer::Unknown(peer) => peer.discover().add_reputation(change.value),
 		}
 	}
 
 	/// Updates the value of `self.latest_time_update` and performs all the updates that happen
 	/// over time, such as reputation increases for staying connected.
 	fn update_time(&mut self) {
+		let now = Instant::now();
+
 		// We basically do `(now - self.latest_update).as_secs()`, except that by the way we do it
 		// we know that we're not going to miss seconds because of rounding to integers.
 		let secs_diff = {
-			let now = Instant::now();
 			let elapsed_latest = self.latest_time_update - self.created;
 			let elapsed_now = now - self.created;
 			self.latest_time_update = now;
@@ -293,7 +335,7 @@ impl Peerset {
 		// takes `ln(0.5) / ln(k)` seconds to reduce the reputation by half. Use this formula to
 		// empirically determine a value of `k` that looks correct.
 		for _ in 0..secs_diff {
-			for peer in self.data.peers().cloned().collect::<Vec<_>>() {
+			for peer_id in self.data.peers().cloned().collect::<Vec<_>>() {
 				// We use `k = 0.98`, so we divide by `50`. With that value, it takes 34.3 seconds
 				// to reduce the reputation by half.
 				fn reput_tick(reput: i32) -> i32 {
@@ -305,13 +347,27 @@ impl Peerset {
 					}
 					reput.saturating_sub(diff)
 				}
-				match self.data.peer(&peer) {
-					peersstate::Peer::Connected(mut peer) =>
-						peer.set_reputation(reput_tick(peer.reputation())),
-					peersstate::Peer::NotConnected(mut peer) =>
-						peer.set_reputation(reput_tick(peer.reputation())),
+				match self.data.peer(&peer_id) {
+					peersstate::Peer::Connected(mut peer) => {
+						let before = peer.reputation();
+						let after = reput_tick(before);
+						trace!(target: "peerset", "Fleeting {}: {} -> {}", peer_id, before, after);
+						peer.set_reputation(after)
+					}
+					peersstate::Peer::NotConnected(mut peer) => {
+						if peer.reputation() == 0 &&
+							peer.last_connected_or_discovered() + FORGET_AFTER < now
+						{
+							peer.forget_peer();
+						} else {
+							let before = peer.reputation();
+							let after = reput_tick(before);
+							trace!(target: "peerset", "Fleeting {}: {} -> {}", peer_id, before, after);
+							peer.set_reputation(after)
+						}
+					}
 					peersstate::Peer::Unknown(_) => unreachable!("We iterate over known peers; qed")
-				}
+				};
 			}
 		}
 	}
@@ -374,7 +430,10 @@ impl Peerset {
 		let not_connected = match self.data.peer(&peer_id) {
 			// If we're already connected, don't answer, as the docs mention.
 			peersstate::Peer::Connected(_) => return,
-			peersstate::Peer::NotConnected(entry) => entry,
+			peersstate::Peer::NotConnected(mut entry) => {
+				entry.bump_last_connected_or_discovered();
+				entry
+			},
 			peersstate::Peer::Unknown(entry) => entry.discover(),
 		};
 
@@ -432,7 +491,7 @@ impl Peerset {
 	}
 
 	/// Reports an adjustment to the reputation of the given peer.
-	pub fn report_peer(&mut self, peer_id: PeerId, score_diff: i32) {
+	pub fn report_peer(&mut self, peer_id: PeerId, score_diff: ReputationChange) {
 		// We don't immediately perform the adjustments in order to have state consistency. We
 		// don't want the reporting here to take priority over messages sent using the
 		// `PeersetHandle`.
@@ -463,6 +522,11 @@ impl Peerset {
 			"reserved_only": self.reserved_only,
 			"message_queue": self.message_queue.len(),
 		})
+	}
+
+	/// Returns the number of peers that we have discovered.
+	pub fn num_discovered_peers(&self) -> usize {
+		self.data.peers().len()
 	}
 
 	/// Returns priority group by id.
@@ -510,7 +574,7 @@ impl Stream for Peerset {
 mod tests {
 	use libp2p::PeerId;
 	use futures::prelude::*;
-	use super::{PeersetConfig, Peerset, Message, IncomingIndex, BANNED_THRESHOLD};
+	use super::{PeersetConfig, Peerset, Message, IncomingIndex, ReputationChange, BANNED_THRESHOLD};
 	use std::{pin::Pin, task::Poll, thread, time::Duration};
 
 	fn assert_messages(mut peerset: Peerset, messages: Vec<Message>) -> Peerset {
@@ -539,7 +603,7 @@ mod tests {
 			out_peers: 2,
 			bootnodes: vec![bootnode],
 			reserved_only: true,
-			reserved_nodes: Vec::new(),
+			priority_groups: Vec::new(),
 		};
 
 		let (peerset, handle) = Peerset::from_config(config);
@@ -567,7 +631,7 @@ mod tests {
 			out_peers: 1,
 			bootnodes: vec![bootnode.clone()],
 			reserved_only: false,
-			reserved_nodes: Vec::new(),
+			priority_groups: Vec::new(),
 		};
 
 		let (mut peerset, _handle) = Peerset::from_config(config);
@@ -594,7 +658,7 @@ mod tests {
 			out_peers: 2,
 			bootnodes: vec![bootnode.clone()],
 			reserved_only: false,
-			reserved_nodes: vec![],
+			priority_groups: vec![],
 		};
 
 		let (mut peerset, _handle) = Peerset::from_config(config);
@@ -615,12 +679,12 @@ mod tests {
 			out_peers: 25,
 			bootnodes: vec![],
 			reserved_only: false,
-			reserved_nodes: vec![],
+			priority_groups: vec![],
 		});
 
 		// We ban a node by setting its reputation under the threshold.
 		let peer_id = PeerId::random();
-		handle.report_peer(peer_id.clone(), BANNED_THRESHOLD - 1);
+		handle.report_peer(peer_id.clone(), ReputationChange::new(BANNED_THRESHOLD - 1, ""));
 
 		let fut = futures::future::poll_fn(move |cx| {
 			// We need one polling for the message to be processed.

@@ -1,24 +1,26 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use super::*;
 
-use network::{self, PeerId};
-use network::config::Roles;
-use test_client::runtime::Block;
+use sc_network::{self, PeerId};
+use sc_network::config::Role;
+use substrate_test_runtime_client::runtime::Block;
 use assert_matches::assert_matches;
 use futures::{prelude::*, channel::mpsc};
 use std::thread;
@@ -55,12 +57,21 @@ fn api<T: Into<Option<Status>>>(sync: T) -> System<Block> {
 						should_have_peers,
 					});
 				},
+				Request::LocalPeerId(sender) => {
+					let _ = sender.send("QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV".to_string());
+				},
+				Request::LocalListenAddresses(sender) => {
+					let _ = sender.send(vec![
+						"/ip4/198.51.100.19/tcp/30333/p2p/QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV".to_string(),
+						"/ip4/127.0.0.1/tcp/30334/ws/p2p/QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV".to_string(),
+					]);
+				},
 				Request::Peers(sender) => {
 					let mut peers = vec![];
 					for _peer in 0..status.peers {
 						peers.push(PeerInfo {
 							peer_id: status.peer_id.to_base58(),
-							roles: format!("{:?}", Roles::FULL),
+							roles: format!("{}", Role::Full),
 							protocol_version: 1,
 							best_hash: Default::default(),
 							best_number: 1,
@@ -69,7 +80,7 @@ fn api<T: Into<Option<Status>>>(sync: T) -> System<Block> {
 					let _ = sender.send(peers);
 				}
 				Request::NetworkState(sender) => {
-					let _ = sender.send(serde_json::to_value(&network::NetworkState {
+					let _ = sender.send(serde_json::to_value(&sc_network::network_state::NetworkState {
 						peer_id: String::new(),
 						listened_addresses: Default::default(),
 						external_addresses: Default::default(),
@@ -80,6 +91,18 @@ fn api<T: Into<Option<Status>>>(sync: T) -> System<Block> {
 						peerset: serde_json::Value::Null,
 					}).unwrap());
 				},
+				Request::NetworkAddReservedPeer(peer, sender) => {
+					let _ = match sc_network::config::parse_str_addr(&peer) {
+						Ok(_) => sender.send(Ok(())),
+						Err(s) => sender.send(Err(error::Error::MalformattedPeerArg(s.to_string()))),
+					};
+				},
+				Request::NetworkRemoveReservedPeer(peer, sender) => {
+					let _ = match peer.parse::<PeerId>() {
+						Ok(_) => sender.send(Ok(())),
+						Err(s) => sender.send(Err(error::Error::MalformattedPeerArg(s.to_string()))),
+					};
+				}
 				Request::NodeRoles(sender) => {
 					let _ = sender.send(vec![NodeRole::Authority]);
 				}
@@ -88,12 +111,17 @@ fn api<T: Into<Option<Status>>>(sync: T) -> System<Block> {
 			future::ready(())
 		}))
 	});
-	System::new(SystemInfo {
-		impl_name: "testclient".into(),
-		impl_version: "0.2.0".into(),
-		chain_name: "testchain".into(),
-		properties: Default::default(),
-	}, tx)
+	System::new(
+		SystemInfo {
+			impl_name: "testclient".into(),
+			impl_version: "0.2.0".into(),
+			chain_name: "testchain".into(),
+			properties: Default::default(),
+			chain_type: Default::default(),
+		},
+		tx,
+		sc_rpc_api::DenyUnsafe::No
+	)
 }
 
 fn wait_receiver<T>(rx: Receiver<T>) -> T {
@@ -105,7 +133,7 @@ fn wait_receiver<T>(rx: Receiver<T>) -> T {
 fn system_name_works() {
 	assert_eq!(
 		api(None).system_name().unwrap(),
-		"testclient".to_owned()
+		"testclient".to_owned(),
 	);
 }
 
@@ -113,7 +141,7 @@ fn system_name_works() {
 fn system_version_works() {
 	assert_eq!(
 		api(None).system_version().unwrap(),
-		"0.2.0".to_owned()
+		"0.2.0".to_owned(),
 	);
 }
 
@@ -121,7 +149,7 @@ fn system_version_works() {
 fn system_chain_works() {
 	assert_eq!(
 		api(None).system_chain().unwrap(),
-		"testchain".to_owned()
+		"testchain".to_owned(),
 	);
 }
 
@@ -129,7 +157,15 @@ fn system_chain_works() {
 fn system_properties_works() {
 	assert_eq!(
 		api(None).system_properties().unwrap(),
-		serde_json::map::Map::new()
+		serde_json::map::Map::new(),
+	);
+}
+
+#[test]
+fn system_type_works() {
+	assert_eq!(
+		api(None).system_type().unwrap(),
+		Default::default(),
 	);
 }
 
@@ -188,15 +224,39 @@ fn system_health() {
 }
 
 #[test]
-fn system_peers() {
-	let peer_id = PeerId::random();
+fn system_local_peer_id_works() {
 	assert_eq!(
-		wait_receiver(api(Status {
-			peer_id: peer_id.clone(),
-			peers: 1,
-			is_syncing: false,
-			is_dev: true,
-		}).system_peers()),
+		wait_receiver(api(None).system_local_peer_id()),
+		"QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV".to_owned(),
+	);
+}
+
+#[test]
+fn system_local_listen_addresses_works() {
+	assert_eq!(
+		wait_receiver(api(None).system_local_listen_addresses()),
+		vec![
+			"/ip4/198.51.100.19/tcp/30333/p2p/QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV".to_string(),
+			"/ip4/127.0.0.1/tcp/30334/ws/p2p/QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV".to_string(),
+		]
+	);
+}
+
+#[test]
+fn system_peers() {
+	let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
+
+	let peer_id = PeerId::random();
+	let req = api(Status {
+		peer_id: peer_id.clone(),
+		peers: 1,
+		is_syncing: false,
+		is_dev: true,
+	}).system_peers();
+	let res = runtime.block_on(req).unwrap();
+
+	assert_eq!(
+		res,
 		vec![PeerInfo {
 			peer_id: peer_id.to_base58(),
 			roles: "FULL".into(),
@@ -209,10 +269,13 @@ fn system_peers() {
 
 #[test]
 fn system_network_state() {
-	let res = wait_receiver(api(None).system_network_state());
+	let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
+	let req = api(None).system_network_state();
+	let res = runtime.block_on(req).unwrap();
+
 	assert_eq!(
-		serde_json::from_value::<network::NetworkState>(res).unwrap(),
-		network::NetworkState {
+		serde_json::from_value::<sc_network::network_state::NetworkState>(res).unwrap(),
+		sc_network::network_state::NetworkState {
 			peer_id: String::new(),
 			listened_addresses: Default::default(),
 			external_addresses: Default::default(),
@@ -231,4 +294,28 @@ fn system_node_roles() {
 		wait_receiver(api(None).system_node_roles()),
 		vec![NodeRole::Authority]
 	);
+}
+
+#[test]
+fn system_network_add_reserved() {
+	let good_peer_id = "/ip4/198.51.100.19/tcp/30333/p2p/QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV";
+	let bad_peer_id = "/ip4/198.51.100.19/tcp/30333";
+	let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
+
+	let good_fut = api(None).system_add_reserved_peer(good_peer_id.into());
+	let bad_fut = api(None).system_add_reserved_peer(bad_peer_id.into());
+	assert_eq!(runtime.block_on(good_fut), Ok(()));
+	assert!(runtime.block_on(bad_fut).is_err());
+}
+
+#[test]
+fn system_network_remove_reserved() {
+	let good_peer_id = "QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV";
+	let bad_peer_id = "/ip4/198.51.100.19/tcp/30333/p2p/QmSk5HQbn6LhUwDiNMseVUjuRYhEtYj4aUZ6WfWoGURpdV";
+	let mut runtime = tokio::runtime::current_thread::Runtime::new().unwrap();
+
+	let good_fut = api(None).system_remove_reserved_peer(good_peer_id.into());
+	let bad_fut = api(None).system_remove_reserved_peer(bad_peer_id.into());
+	assert_eq!(runtime.block_on(good_fut), Ok(()));
+	assert!(runtime.block_on(bad_fut).is_err());
 }

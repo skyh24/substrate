@@ -1,25 +1,26 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // tag::description[]
 //! Simple Ed25519 API.
 // end::description[]
 
 #[cfg(feature = "full_crypto")]
-use rstd::vec::Vec;
+use sp_std::vec::Vec;
 
 use crate::{hash::H256, hash::H512};
 use codec::{Encode, Decode};
@@ -38,9 +39,12 @@ use crate::crypto::{Pair as TraitPair, DeriveJunction, SecretStringError};
 use crate::crypto::Ss58Codec;
 #[cfg(feature = "std")]
 use serde::{de, Serializer, Serialize, Deserializer, Deserialize};
-use crate::{crypto::{Public as TraitPublic, UncheckedFrom, CryptoType, Derive}};
-use runtime_interface::pass_by::PassByInner;
-use rstd::ops::Deref;
+use crate::crypto::{Public as TraitPublic, CryptoTypePublicPair, UncheckedFrom, CryptoType, Derive, CryptoTypeId};
+use sp_runtime_interface::pass_by::PassByInner;
+use sp_std::ops::Deref;
+
+/// An identifier used to match public keys against ed25519 keys
+pub const CRYPTO_ID: CryptoTypeId = CryptoTypeId(*b"ed25");
 
 /// A secret seed. It's not called a "secret key" because ring doesn't expose the secret keys
 /// of the key pair (yeah, dumb); as such we're forced to remember the seed manually if we
@@ -94,7 +98,7 @@ impl Deref for Public {
 	}
 }
 
-impl rstd::convert::TryFrom<&[u8]> for Public {
+impl sp_std::convert::TryFrom<&[u8]> for Public {
 	type Error = ();
 
 	fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
@@ -155,15 +159,15 @@ impl std::fmt::Display for Public {
 	}
 }
 
-impl rstd::fmt::Debug for Public {
+impl sp_std::fmt::Debug for Public {
 	#[cfg(feature = "std")]
-	fn fmt(&self, f: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+	fn fmt(&self, f: &mut sp_std::fmt::Formatter) -> sp_std::fmt::Result {
 		let s = self.to_ss58check();
 		write!(f, "{} ({}...)", crate::hexdisplay::HexDisplay::from(&self.0), &s[0..8])
 	}
 
 	#[cfg(not(feature = "std"))]
-	fn fmt(&self, _: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+	fn fmt(&self, _: &mut sp_std::fmt::Formatter) -> sp_std::fmt::Result {
 		Ok(())
 	}
 }
@@ -187,7 +191,7 @@ impl<'de> Deserialize<'de> for Public {
 #[derive(Encode, Decode, PassByInner)]
 pub struct Signature(pub [u8; 64]);
 
-impl rstd::convert::TryFrom<&[u8]> for Signature {
+impl sp_std::convert::TryFrom<&[u8]> for Signature {
 	type Error = ();
 
 	fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
@@ -270,22 +274,22 @@ impl AsMut<[u8]> for Signature {
 	}
 }
 
-impl rstd::fmt::Debug for Signature {
+impl sp_std::fmt::Debug for Signature {
 	#[cfg(feature = "std")]
-	fn fmt(&self, f: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+	fn fmt(&self, f: &mut sp_std::fmt::Formatter) -> sp_std::fmt::Result {
 		write!(f, "{}", crate::hexdisplay::HexDisplay::from(&self.0))
 	}
 
 	#[cfg(not(feature = "std"))]
-	fn fmt(&self, _: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+	fn fmt(&self, _: &mut sp_std::fmt::Formatter) -> sp_std::fmt::Result {
 		Ok(())
 	}
 }
 
 #[cfg(feature = "full_crypto")]
-impl rstd::hash::Hash for Signature {
-	fn hash<H: rstd::hash::Hasher>(&self, state: &mut H) {
-		rstd::hash::Hash::hash(&self.0[..], state);
+impl sp_std::hash::Hash for Signature {
+	fn hash<H: sp_std::hash::Hasher>(&self, state: &mut H) {
+		sp_std::hash::Hash::hash(&self.0[..], state);
 	}
 }
 
@@ -374,9 +378,25 @@ impl TraitPublic for Public {
 		r.copy_from_slice(data);
 		Public(r)
 	}
+
+	fn to_public_crypto_pair(&self) -> CryptoTypePublicPair {
+		CryptoTypePublicPair(CRYPTO_ID, self.to_raw_vec())
+	}
 }
 
 impl Derive for Public {}
+
+impl From<Public> for CryptoTypePublicPair {
+	fn from(key: Public) -> Self {
+		(&key).into()
+	}
+}
+
+impl From<&Public> for CryptoTypePublicPair {
+	fn from(key: &Public) -> Self {
+		CryptoTypePublicPair(CRYPTO_ID, key.to_raw_vec())
+	}
+}
 
 /// Derive a single hard junction.
 #[cfg(feature = "full_crypto")]
@@ -433,7 +453,7 @@ impl TraitPair for Pair {
 
 	/// Make a new key pair from secret seed material.
 	///
-	/// You should never need to use this; generate(), generate_with_phrasee
+	/// You should never need to use this; generate(), generate_with_phrase
 	fn from_seed(seed: &Seed) -> Pair {
 		Self::from_seed_slice(&seed[..]).expect("seed has valid length; qed")
 	}
@@ -445,7 +465,7 @@ impl TraitPair for Pair {
 	fn from_seed_slice(seed_slice: &[u8]) -> Result<Pair, SecretStringError> {
 		let secret = ed25519_dalek::SecretKey::from_bytes(seed_slice)
 			.map_err(|_| SecretStringError::InvalidSeedLength)?;
-		let public = ed25519_dalek::PublicKey::from(secret.expand::<sha2::Sha512>());
+		let public = ed25519_dalek::PublicKey::from(&secret);
 		Ok(Pair(ed25519_dalek::Keypair { secret, public }))
 	}
 
@@ -474,7 +494,7 @@ impl TraitPair for Pair {
 
 	/// Sign a message.
 	fn sign(&self, message: &[u8]) -> Signature {
-		let r = self.0.sign::<sha2::Sha512>(message).to_bytes();
+		let r = self.0.sign(message).to_bytes();
 		Signature::from_raw(r)
 	}
 
@@ -498,7 +518,7 @@ impl TraitPair for Pair {
 			Err(_) => return false
 		};
 
-		match public_key.verify::<sha2::Sha512>(message.as_ref(), &sig) {
+		match public_key.verify(message.as_ref(), &sig) {
 			Ok(_) => true,
 			_ => false,
 		}

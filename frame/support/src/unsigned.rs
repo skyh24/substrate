@@ -1,25 +1,25 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #[doc(hidden)]
-#[allow(deprecated)]
-pub use crate::sr_primitives::traits::ValidateUnsigned;
+pub use crate::sp_runtime::traits::ValidateUnsigned;
 #[doc(hidden)]
-pub use crate::sr_primitives::transaction_validity::{
-	TransactionValidity, UnknownTransaction, TransactionValidityError,
+pub use crate::sp_runtime::transaction_validity::{
+	TransactionValidity, UnknownTransaction, TransactionValidityError, TransactionSource,
 };
 
 
@@ -35,7 +35,8 @@ pub use crate::sr_primitives::transaction_validity::{
 /// # 	impl frame_support::unsigned::ValidateUnsigned for Module {
 /// # 		type Call = Call;
 /// #
-/// # 		fn validate_unsigned(call: &Self::Call) -> frame_support::unsigned::TransactionValidity {
+/// # 		fn validate_unsigned(_source: frame_support::unsigned::TransactionSource, _call: &Self::Call)
+/// 			-> frame_support::unsigned::TransactionValidity {
 /// # 			unimplemented!();
 /// # 		}
 /// # 	}
@@ -66,7 +67,6 @@ macro_rules! impl_outer_validate_unsigned {
 			$( $module:ident )*
 		}
 	) => {
-		#[allow(deprecated)] // Allow ValidateUnsigned
 		impl $crate::unsigned::ValidateUnsigned for $runtime {
 			type Call = Call;
 
@@ -80,10 +80,14 @@ macro_rules! impl_outer_validate_unsigned {
 				}
 			}
 
-			fn validate_unsigned(call: &Self::Call) -> $crate::unsigned::TransactionValidity {
+			fn validate_unsigned(
+				#[allow(unused_variables)]
+				source: $crate::unsigned::TransactionSource,
+				call: &Self::Call,
+			) -> $crate::unsigned::TransactionValidity {
 				#[allow(unreachable_patterns)]
 				match call {
-					$( Call::$module(inner_call) => $module::validate_unsigned(inner_call), )*
+					$( Call::$module(inner_call) => $module::validate_unsigned(source, inner_call), )*
 					_ => $crate::unsigned::UnknownTransaction::NoUnsignedValidator.into(),
 				}
 			}
@@ -109,11 +113,13 @@ mod test_partial_and_full_call {
 	pub mod timestamp {
 		pub struct Module;
 
-		#[allow(deprecated)] // Allow ValidateUnsigned
 		impl super::super::ValidateUnsigned for Module {
 			type Call = Call;
 
-			fn validate_unsigned(_call: &Self::Call) -> super::super::TransactionValidity {
+			fn validate_unsigned(
+				_source: super::super::TransactionSource,
+				_call: &Self::Call
+			) -> super::super::TransactionValidity {
 				unimplemented!();
 			}
 		}

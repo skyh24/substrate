@@ -1,26 +1,27 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Substrate blockchain trait
 
 use std::sync::Arc;
 
-use sr_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor};
-use sr_primitives::generic::BlockId;
-use sr_primitives::Justification;
+use sp_runtime::traits::{Block as BlockT, Header as HeaderT, NumberFor};
+use sp_runtime::generic::BlockId;
+use sp_runtime::Justification;
 use log::warn;
 use parking_lot::RwLock;
 
@@ -59,19 +60,23 @@ pub trait HeaderBackend<Block: BlockT>: Send + Sync {
 
 	/// Get block header. Returns `UnknownBlock` error if block is not found.
 	fn expect_header(&self, id: BlockId<Block>) -> Result<Block::Header> {
-		self.header(id)?.ok_or_else(|| Error::UnknownBlock(format!("{}", id)))
+		self.header(id)?.ok_or_else(|| Error::UnknownBlock(format!("Expect header: {}", id)))
 	}
 
 	/// Convert an arbitrary block ID into a block number. Returns `UnknownBlock` error if block is not found.
 	fn expect_block_number_from_id(&self, id: &BlockId<Block>) -> Result<NumberFor<Block>> {
 		self.block_number_from_id(id)
-			.and_then(|n| n.ok_or_else(|| Error::UnknownBlock(format!("{}", id))))
+			.and_then(|n| n.ok_or_else(||
+				Error::UnknownBlock(format!("Expect block number from id: {}", id))
+			))
 	}
 
 	/// Convert an arbitrary block ID into a block hash. Returns `UnknownBlock` error if block is not found.
 	fn expect_block_hash_from_id(&self, id: &BlockId<Block>) -> Result<Block::Hash> {
 		self.block_hash_from_id(id)
-			.and_then(|n| n.ok_or_else(|| Error::UnknownBlock(format!("{}", id))))
+			.and_then(|n| n.ok_or_else(||
+				Error::UnknownBlock(format!("Expect block hash from id: {}", id))
+			))
 	}
 }
 
@@ -228,15 +233,17 @@ pub trait Cache<Block: BlockT>: Send + Sync {
 	/// Returns cached value by the given key.
 	///
 	/// Returned tuple is the range where value has been active and the value itself.
+	/// Fails if read from cache storage fails or if the value for block is discarded
+	/// (i.e. if block is earlier that best finalized, but it is not in canonical chain).
 	fn get_at(
 		&self,
 		key: &well_known_cache_keys::Id,
 		block: &BlockId<Block>,
-	) -> Option<((NumberFor<Block>, Block::Hash), Option<(NumberFor<Block>, Block::Hash)>, Vec<u8>)>;
+	) -> Result<Option<((NumberFor<Block>, Block::Hash), Option<(NumberFor<Block>, Block::Hash)>, Vec<u8>)>>;
 }
 
 /// Blockchain info
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Info<Block: BlockT> {
 	/// Best block hash.
 	pub best_hash: Block::Hash,
@@ -248,6 +255,8 @@ pub struct Info<Block: BlockT> {
 	pub finalized_hash: Block::Hash,
 	/// Last finalized block number.
 	pub finalized_number: <<Block as BlockT>::Header as HeaderT>::Number,
+	/// Number of concurrent leave forks.
+	pub number_leaves: usize
 }
 
 /// Block status.

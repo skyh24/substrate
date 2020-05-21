@@ -1,28 +1,33 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Changes trie storage utilities.
 
 use std::collections::{BTreeMap, HashSet, HashMap};
 use hash_db::{Hasher, Prefix, EMPTY_PREFIX};
-use trie::DBValue;
-use trie::MemoryDB;
+use sp_core::storage::PrefixedStorageKey;
+use sp_trie::DBValue;
+use sp_trie::MemoryDB;
 use parking_lot::RwLock;
-use crate::changes_trie::{BuildCache, RootsStorage, Storage, AnchorBlockId, BlockNumber};
-use crate::trie_backend_essence::TrieBackendStorage;
+use crate::{
+	StorageKey,
+	trie_backend_essence::TrieBackendStorage,
+	changes_trie::{BuildCache, RootsStorage, Storage, AnchorBlockId, BlockNumber},
+};
 
 #[cfg(test)]
 use crate::backend::insert_into_memory_db;
@@ -38,7 +43,7 @@ pub struct InMemoryStorage<H: Hasher, Number: BlockNumber> {
 /// Adapter for using changes trie storage as a TrieBackendEssence' storage.
 pub struct TrieBackendAdapter<'a, H: Hasher, Number: BlockNumber> {
 	storage: &'a dyn Storage<H, Number>,
-	_hasher: ::std::marker::PhantomData<(H, Number)>,
+	_hasher: std::marker::PhantomData<(H, Number)>,
 }
 
 struct InMemoryStorageData<H: Hasher, Number: BlockNumber> {
@@ -93,7 +98,7 @@ impl<H: Hasher, Number: BlockNumber> InMemoryStorage<H, Number> {
 	#[cfg(test)]
 	pub fn with_inputs(
 		mut top_inputs: Vec<(Number, Vec<InputPair<Number>>)>,
-		children_inputs: Vec<(Vec<u8>, Vec<(Number, Vec<InputPair<Number>>)>)>,
+		children_inputs: Vec<(PrefixedStorageKey, Vec<(Number, Vec<InputPair<Number>>)>)>,
 	) -> Self {
 		let mut mdb = MemoryDB::default();
 		let mut roots = BTreeMap::new();
@@ -179,7 +184,7 @@ impl<H: Hasher, Number: BlockNumber> Storage<H, Number> for InMemoryStorage<H, N
 	fn with_cached_changed_keys(
 		&self,
 		root: &H::Out,
-		functor: &mut dyn FnMut(&HashMap<Option<Vec<u8>>, HashSet<Vec<u8>>>),
+		functor: &mut dyn FnMut(&HashMap<Option<PrefixedStorageKey>, HashSet<StorageKey>>),
 	) -> bool {
 		self.cache.with_changed_keys(root, functor)
 	}

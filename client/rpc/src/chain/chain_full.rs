@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -19,42 +19,40 @@
 use std::sync::Arc;
 use rpc::futures::future::result;
 
-use api::Subscriptions;
-use client_api::{CallExecutor, backend::Backend};
-use client::Client;
-use primitives::{H256, Blake2Hasher};
-use sr_primitives::{
-	generic::{BlockId, SignedBlock},
-	traits::{Block as BlockT},
-};
+use sc_rpc_api::Subscriptions;
+use sc_client_api::{BlockchainEvents, BlockBackend};
+use sp_runtime::{generic::{BlockId, SignedBlock}, traits::{Block as BlockT}};
 
 use super::{ChainBackend, client_err, error::FutureResult};
+use std::marker::PhantomData;
+use sp_blockchain::HeaderBackend;
 
 /// Blockchain API backend for full nodes. Reads all the data from local database.
-pub struct FullChain<B, E, Block: BlockT, RA> {
+pub struct FullChain<Block: BlockT, Client> {
 	/// Substrate client.
-	client: Arc<Client<B, E, Block, RA>>,
+	client: Arc<Client>,
 	/// Current subscriptions.
 	subscriptions: Subscriptions,
+	/// phantom member to pin the block type
+	_phantom: PhantomData<Block>,
 }
 
-impl<B, E, Block: BlockT, RA> FullChain<B, E, Block, RA> {
+impl<Block: BlockT, Client> FullChain<Block, Client> {
 	/// Create new Chain API RPC handler.
-	pub fn new(client: Arc<Client<B, E, Block, RA>>, subscriptions: Subscriptions) -> Self {
+	pub fn new(client: Arc<Client>, subscriptions: Subscriptions) -> Self {
 		Self {
 			client,
 			subscriptions,
+			_phantom: PhantomData,
 		}
 	}
 }
 
-impl<B, E, Block, RA> ChainBackend<B, E, Block, RA> for FullChain<B, E, Block, RA> where
-	Block: BlockT<Hash=H256> + 'static,
-	B: Backend<Block, Blake2Hasher> + Send + Sync + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	RA: Send + Sync + 'static,
+impl<Block, Client> ChainBackend<Client, Block> for FullChain<Block, Client> where
+	Block: BlockT + 'static,
+	Client: BlockBackend<Block> + HeaderBackend<Block> + BlockchainEvents<Block> + 'static,
 {
-	fn client(&self) -> &Arc<Client<B, E, Block, RA>> {
+	fn client(&self) -> &Arc<Client> {
 		&self.client
 	}
 
@@ -64,7 +62,7 @@ impl<B, E, Block, RA> ChainBackend<B, E, Block, RA> for FullChain<B, E, Block, R
 
 	fn header(&self, hash: Option<Block::Hash>) -> FutureResult<Option<Block::Header>> {
 		Box::new(result(self.client
-			.header(&BlockId::Hash(self.unwrap_or_best(hash)))
+			.header(BlockId::Hash(self.unwrap_or_best(hash)))
 			.map_err(client_err)
 		))
 	}

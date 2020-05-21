@@ -1,54 +1,61 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use futures::prelude::*;
-use futures::{future, sync::mpsc};
 
-use grandpa::{
+use finality_grandpa::{
 	BlockNumberOps, Error as GrandpaError, voter, voter_set::VoterSet
 };
 use log::{debug, info, warn};
 
-use consensus_common::SelectChain;
-use client_api::{CallExecutor, backend::Backend};
-use client::Client;
-use sr_primitives::traits::{NumberFor, Block as BlockT};
-use primitives::{H256, Blake2Hasher};
+use sp_consensus::SelectChain;
+use sc_client_api::backend::Backend;
+use sp_utils::mpsc::TracingUnboundedReceiver;
+use sp_runtime::traits::{NumberFor, Block as BlockT};
+use sp_blockchain::HeaderMetadata;
 
 use crate::{
 	global_communication, CommandOrError, CommunicationIn, Config, environment,
-	LinkHalf, Network, Error, aux_schema::PersistentData, VoterCommand, VoterSetState,
+	LinkHalf, Error, aux_schema::PersistentData, VoterCommand, VoterSetState,
 };
 use crate::authorities::SharedAuthoritySet;
-use crate::communication::NetworkBridge;
+use crate::communication::{Network as NetworkT, NetworkBridge};
 use crate::consensus_changes::SharedConsensusChanges;
-use fg_primitives::AuthorityId;
+use sp_finality_grandpa::AuthorityId;
+use std::marker::{PhantomData, Unpin};
 
-struct ObserverChain<'a, Block: BlockT, B, E, RA>(&'a Client<B, E, Block, RA>);
+struct ObserverChain<'a, Block: BlockT, Client> {
+	client: &'a Arc<Client>,
+	_phantom: PhantomData<Block>,
+}
 
-impl<'a, Block: BlockT<Hash=H256>, B, E, RA> grandpa::Chain<Block::Hash, NumberFor<Block>>
-	for ObserverChain<'a, Block, B, E, RA> where
-		B: Backend<Block, Blake2Hasher>,
-		E: CallExecutor<Block, Blake2Hasher>,
+impl<'a, Block, Client> finality_grandpa::Chain<Block::Hash, NumberFor<Block>>
+	for ObserverChain<'a, Block, Client> where
+		Block: BlockT,
+		Client: HeaderMetadata<Block, Error = sp_blockchain::Error>,
 		NumberFor<Block>: BlockNumberOps,
 {
 	fn ancestry(&self, base: Block::Hash, block: Block::Hash) -> Result<Vec<Block::Hash>, GrandpaError> {
-		environment::ancestry(&self.0, base, block)
+		environment::ancestry(&self.client, base, block)
 	}
 
 	fn best_chain_containing(&self, _block: Block::Hash) -> Option<(Block::Hash, NumberFor<Block>)> {
@@ -57,34 +64,32 @@ impl<'a, Block: BlockT<Hash=H256>, B, E, RA> grandpa::Chain<Block::Hash, NumberF
 	}
 }
 
-fn grandpa_observer<B, E, Block: BlockT<Hash=H256>, RA, S, F>(
-	client: &Arc<Client<B, E, Block, RA>>,
+fn grandpa_observer<BE, Block: BlockT, Client, S, F>(
+	client: &Arc<Client>,
 	authority_set: &SharedAuthoritySet<Block::Hash, NumberFor<Block>>,
 	consensus_changes: &SharedConsensusChanges<Block::Hash, NumberFor<Block>>,
 	voters: &Arc<VoterSet<AuthorityId>>,
 	last_finalized_number: NumberFor<Block>,
 	commits: S,
 	note_round: F,
-) -> impl Future<Item=(), Error=CommandOrError<H256, NumberFor<Block>>> where
+) -> impl Future<Output=Result<(), CommandOrError<Block::Hash, NumberFor<Block>>>> where
 	NumberFor<Block>: BlockNumberOps,
-	B: Backend<Block, Blake2Hasher>,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync,
-	RA: Send + Sync,
 	S: Stream<
-		Item = CommunicationIn<Block>,
-		Error = CommandOrError<Block::Hash, NumberFor<Block>>,
+		Item = Result<CommunicationIn<Block>, CommandOrError<Block::Hash, NumberFor<Block>>>,
 	>,
 	F: Fn(u64),
+	BE: Backend<Block>,
+	Client: crate::ClientForGrandpa<Block, BE>,
 {
 	let authority_set = authority_set.clone();
 	let consensus_changes = consensus_changes.clone();
 	let client = client.clone();
 	let voters = voters.clone();
 
-	let observer = commits.fold(last_finalized_number, move |last_finalized_number, global| {
+	let observer = commits.try_fold(last_finalized_number, move |last_finalized_number, global| {
 		let (round, commit, callback) = match global {
 			voter::CommunicationIn::Commit(round, commit, callback) => {
-				let commit = grandpa::Commit::from(commit);
+				let commit = finality_grandpa::Commit::from(commit);
 				(round, commit, callback)
 			},
 			voter::CommunicationIn::CatchUp(..) => {
@@ -99,28 +104,29 @@ fn grandpa_observer<B, E, Block: BlockT<Hash=H256>, RA, S, F>(
 			return future::ok(last_finalized_number);
 		}
 
-		let validation_result = match grandpa::validate_commit(
+		let validation_result = match finality_grandpa::validate_commit(
 			&commit,
 			&voters,
-			&ObserverChain(&*client),
+			&ObserverChain { client: &client, _phantom: PhantomData },
 		) {
 			Ok(r) => r,
 			Err(e) => return future::err(e.into()),
 		};
 
-		if let Some(_) = validation_result.ghost() {
+		if validation_result.ghost().is_some() {
 			let finalized_hash = commit.target_hash;
 			let finalized_number = commit.target_number;
 
 			// commit is valid, finalize the block it targets
 			match environment::finalize_block(
-				&client,
+				client.clone(),
 				&authority_set,
 				&consensus_changes,
 				None,
 				finalized_hash,
 				finalized_number,
 				(round, commit).into(),
+				false,
 			) {
 				Ok(_) => {},
 				Err(e) => return future::err(e),
@@ -130,112 +136,112 @@ fn grandpa_observer<B, E, Block: BlockT<Hash=H256>, RA, S, F>(
 			// and that implies that the next round has started.
 			note_round(round + 1);
 
-			grandpa::process_commit_validation_result(validation_result, callback);
+			finality_grandpa::process_commit_validation_result(validation_result, callback);
 
 			// proceed processing with new finalized block number
 			future::ok(finalized_number)
 		} else {
 			debug!(target: "afg", "Received invalid commit: ({:?}, {:?})", round, commit);
 
-			grandpa::process_commit_validation_result(validation_result, callback);
+			finality_grandpa::process_commit_validation_result(validation_result, callback);
 
 			// commit is invalid, continue processing commits with the current state
 			future::ok(last_finalized_number)
 		}
 	});
 
-	observer.map(|_| ())
+	observer.map_ok(|_| ())
 }
 
 /// Run a GRANDPA observer as a task, the observer will finalize blocks only by
 /// listening for and validating GRANDPA commits instead of following the full
 /// protocol. Provide configuration and a link to a block import worker that has
 /// already been instantiated with `block_import`.
-pub fn run_grandpa_observer<B, E, Block: BlockT<Hash=H256>, N, RA, SC>(
+/// NOTE: this is currently not part of the crate's public API since we don't consider
+/// it stable enough to use on a live network.
+#[allow(unused)]
+pub fn run_grandpa_observer<BE, Block: BlockT, Client, N, SC>(
 	config: Config,
-	link: LinkHalf<B, E, Block, RA, SC>,
+	link: LinkHalf<Block, Client, SC>,
 	network: N,
-	on_exit: impl Future<Item=(),Error=()> + Clone + Send + 'static,
-) -> ::sp_blockchain::Result<impl Future<Item=(),Error=()> + Send + 'static> where
-	B: Backend<Block, Blake2Hasher> + 'static,
-	E: CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	N: Network<Block> + Send + Sync + 'static,
-	N::In: Send + 'static,
+) -> sp_blockchain::Result<impl Future<Output = ()> + Unpin + Send + 'static>
+where
+	BE: Backend<Block> + Unpin + 'static,
+	N: NetworkT<Block> + Send + Clone + 'static,
 	SC: SelectChain<Block> + 'static,
 	NumberFor<Block>: BlockNumberOps,
-	RA: Send + Sync + 'static,
+	Client: crate::ClientForGrandpa<Block, BE> + 'static,
 {
 	let LinkHalf {
 		client,
 		select_chain: _,
 		persistent_data,
 		voter_commands_rx,
+		..
 	} = link;
 
-	let (network, network_startup) = NetworkBridge::new(
+	let network = NetworkBridge::new(
 		network,
 		config.clone(),
 		persistent_data.set_state.clone(),
-		on_exit.clone(),
+		None,
 	);
 
 	let observer_work = ObserverWork::new(
 		client,
 		network,
 		persistent_data,
-		config.keystore.clone(),
+		config.keystore,
 		voter_commands_rx
 	);
 
 	let observer_work = observer_work
-		.map(|_| ())
+		.map_ok(|_| ())
 		.map_err(|e| {
 			warn!("GRANDPA Observer failed: {:?}", e);
 		});
 
-	let observer_work = network_startup.and_then(move |()| observer_work);
-
-	Ok(observer_work.select(on_exit).map(|_| ()).map_err(|_| ()))
+	Ok(observer_work.map(drop))
 }
 
 /// Future that powers the observer.
 #[must_use]
-struct ObserverWork<B: BlockT<Hash=H256>, N: Network<B>, E, Backend, RA> {
-	observer: Box<dyn Future<Item = (), Error = CommandOrError<B::Hash, NumberFor<B>>> + Send>,
-	client: Arc<Client<Backend, E, B, RA>>,
+struct ObserverWork<B: BlockT, BE, Client, N: NetworkT<B>> {
+	observer: Pin<Box<dyn Future<Output = Result<(), CommandOrError<B::Hash, NumberFor<B>>>> + Send>>,
+	client: Arc<Client>,
 	network: NetworkBridge<B, N>,
 	persistent_data: PersistentData<B>,
-	keystore: Option<keystore::KeyStorePtr>,
-	voter_commands_rx: mpsc::UnboundedReceiver<VoterCommand<B::Hash, NumberFor<B>>>,
+	keystore: Option<sc_keystore::KeyStorePtr>,
+	voter_commands_rx: TracingUnboundedReceiver<VoterCommand<B::Hash, NumberFor<B>>>,
+	_phantom: PhantomData<BE>,
 }
 
-impl<B, N, E, Bk, RA> ObserverWork<B, N, E, Bk, RA>
+impl<B, BE, Client, Network> ObserverWork<B, BE, Client, Network>
 where
-	B: BlockT<Hash=H256>,
-	N: Network<B>,
-	N::In: Send + 'static,
+	B: BlockT,
+	BE: Backend<B> + 'static,
+	Client: crate::ClientForGrandpa<B, BE> + 'static,
+	Network: NetworkT<B>,
 	NumberFor<B>: BlockNumberOps,
-	RA: 'static + Send + Sync,
-	E: CallExecutor<B, Blake2Hasher> + Send + Sync + 'static,
-	Bk: Backend<B, Blake2Hasher> + 'static,
 {
 	fn new(
-		client: Arc<Client<Bk, E, B, RA>>,
-		network: NetworkBridge<B, N>,
+		client: Arc<Client>,
+		network: NetworkBridge<B, Network>,
 		persistent_data: PersistentData<B>,
-		keystore: Option<keystore::KeyStorePtr>,
-		voter_commands_rx: mpsc::UnboundedReceiver<VoterCommand<B::Hash, NumberFor<B>>>,
+		keystore: Option<sc_keystore::KeyStorePtr>,
+		voter_commands_rx: TracingUnboundedReceiver<VoterCommand<B::Hash, NumberFor<B>>>,
 	) -> Self {
 
 		let mut work = ObserverWork {
 			// `observer` is set to a temporary value and replaced below when
 			// calling `rebuild_observer`.
-			observer: Box::new(futures::empty()) as Box<_>,
+			observer: Box::pin(future::pending()) as Pin<Box<_>>,
 			client,
 			network,
 			persistent_data,
 			keystore,
 			voter_commands_rx,
+			_phantom: PhantomData,
 		};
 		work.rebuild_observer();
 		work
@@ -252,12 +258,13 @@ where
 		let (global_in, _) = global_communication(
 			set_id,
 			&voters,
-			&self.client,
+			self.client.clone(),
 			&self.network,
 			&self.keystore,
+			None,
 		);
 
-		let last_finalized_number = self.client.info().chain.finalized_number;
+		let last_finalized_number = self.client.info().finalized_number;
 
 		// NOTE: since we are not using `round_communication` we have to
 		// manually note the round with the gossip validator, otherwise we won't
@@ -285,7 +292,7 @@ where
 			note_round,
 		);
 
-		self.observer = Box::new(observer);
+		self.observer = Box::pin(observer);
 	}
 
 	fn handle_voter_command(
@@ -325,54 +332,120 @@ where
 	}
 }
 
-impl<B, N, E, Bk, RA> Future for ObserverWork<B, N, E, Bk, RA>
+impl<B, BE, C, N> Future for ObserverWork<B, BE, C, N>
 where
-	B: BlockT<Hash=H256>,
-	N: Network<B>,
-	N::In: Send + 'static,
+	B: BlockT,
+	BE: Backend<B> + Unpin + 'static,
+	C: crate::ClientForGrandpa<B, BE> + 'static,
+	N: NetworkT<B>,
 	NumberFor<B>: BlockNumberOps,
-	RA: 'static + Send + Sync,
-	E: CallExecutor<B, Blake2Hasher> + Send + Sync + 'static,
-	Bk: Backend<B, Blake2Hasher> + 'static,
 {
-	type Item = ();
-	type Error = Error;
+	type Output = Result<(), Error>;
 
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-		match self.observer.poll() {
-			Ok(Async::NotReady) => {}
-			Ok(Async::Ready(())) => {
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+		match Future::poll(Pin::new(&mut self.observer), cx) {
+			Poll::Pending => {}
+			Poll::Ready(Ok(())) => {
 				// observer commit stream doesn't conclude naturally; this could reasonably be an error.
-				return Ok(Async::Ready(()))
+				return Poll::Ready(Ok(()))
 			}
-			Err(CommandOrError::Error(e)) => {
+			Poll::Ready(Err(CommandOrError::Error(e))) => {
 				// return inner observer error
-				return Err(e)
+				return Poll::Ready(Err(e))
 			}
-			Err(CommandOrError::VoterCommand(command)) => {
+			Poll::Ready(Err(CommandOrError::VoterCommand(command))) => {
 				// some command issued internally
 				self.handle_voter_command(command)?;
-				futures::task::current().notify();
+				cx.waker().wake_by_ref();
 			}
 		}
 
-		match self.voter_commands_rx.poll() {
-			Ok(Async::NotReady) => {}
-			Err(_) => {
-				// the `voter_commands_rx` stream should not fail.
-				return Ok(Async::Ready(()))
-			}
-			Ok(Async::Ready(None)) => {
+		match Stream::poll_next(Pin::new(&mut self.voter_commands_rx), cx) {
+			Poll::Pending => {}
+			Poll::Ready(None) => {
 				// the `voter_commands_rx` stream should never conclude since it's never closed.
-				return Ok(Async::Ready(()))
+				return Poll::Ready(Ok(()))
 			}
-			Ok(Async::Ready(Some(command))) => {
+			Poll::Ready(Some(command)) => {
 				// some command issued externally
 				self.handle_voter_command(command)?;
-				futures::task::current().notify();
+				cx.waker().wake_by_ref();
 			}
 		}
 
-		Ok(Async::NotReady)
+		Future::poll(Pin::new(&mut self.network), cx)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use assert_matches::assert_matches;
+	use sp_utils::mpsc::tracing_unbounded;
+	use crate::{aux_schema,	communication::tests::{Event, make_test_network}};
+	use substrate_test_runtime_client::{TestClientBuilder, TestClientBuilderExt};
+	use sc_network::PeerId;
+	use sp_blockchain::HeaderBackend as _;
+
+	use futures::executor;
+
+	/// Ensure `Future` implementation of `ObserverWork` is polling its `NetworkBridge`. Regression
+	/// test for bug introduced in d4fbb897c and fixed in b7af8b339.
+	///
+	/// When polled, `NetworkBridge` forwards reputation change requests from the `GossipValidator`
+	/// to the underlying `dyn Network`. This test triggers a reputation change by calling
+	/// `GossipValidator::validate` with an invalid gossip message. After polling the `ObserverWork`
+	/// which should poll the `NetworkBridge`, the reputation change should be forwarded to the test
+	/// network.
+	#[test]
+	fn observer_work_polls_underlying_network_bridge() {
+		// Create a test network.
+		let (tester_fut, _network) = make_test_network();
+		let mut tester = executor::block_on(tester_fut);
+
+		// Create an observer.
+		let (client, backend) = {
+			let builder = TestClientBuilder::with_default_backend();
+			let backend = builder.backend();
+			let (client, _) = builder.build_with_longest_chain();
+			(Arc::new(client), backend)
+		};
+
+		let voters = vec![(sp_keyring::Ed25519Keyring::Alice.public().into(), 1)];
+
+		let persistent_data = aux_schema::load_persistent(
+			&*backend,
+			client.info().genesis_hash,
+			0,
+			|| Ok(voters),
+		).unwrap();
+
+		let (_tx, voter_command_rx) = tracing_unbounded("");
+		let observer = ObserverWork::new(
+			client,
+			tester.net_handle.clone(),
+			persistent_data,
+			None,
+			voter_command_rx,
+		);
+
+		// Trigger a reputation change through the gossip validator.
+		let peer_id = PeerId::random();
+		tester.trigger_gossip_validator_reputation_change(&peer_id);
+
+		executor::block_on(async move {
+			// Poll the observer once and have it forward the reputation change from the gossip
+			// validator to the test network.
+			assert!(observer.now_or_never().is_none());
+
+			// Ignore initial event stream request by gossip engine.
+			match tester.events.next().now_or_never() {
+				Some(Some(Event::EventStream(_))) => {},
+				_ => panic!("expected event stream request"),
+			};
+
+			assert_matches!(tester.events.next().now_or_never(), Some(Some(Event::Report(_, _))));
+		});
 	}
 }

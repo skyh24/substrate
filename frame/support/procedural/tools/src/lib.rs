@@ -1,18 +1,19 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // tag::description[]
 //! Proc macro helpers for procedural macros
@@ -27,12 +28,12 @@ use quote::quote;
 
 pub mod syn_ext;
 
-// FIXME #1569, remove the following functions, which are copied from sr-api-macros
+// FIXME #1569, remove the following functions, which are copied from sp-api-macros
 use proc_macro2::{TokenStream, Span};
 use syn::Ident;
 
 fn generate_hidden_includes_mod_name(unique_id: &str) -> Ident {
-	Ident::new(&format!("sr_api_hidden_includes_{}", unique_id), Span::call_site())
+	Ident::new(&format!("sp_api_hidden_includes_{}", unique_id), Span::call_site())
 }
 
 /// Generates the access to the `frame-support` crate.
@@ -47,7 +48,7 @@ pub fn generate_crate_access(unique_id: &str, def_crate: &str) -> TokenStream {
 
 /// Generates the hidden includes that are required to make the macro independent from its scope.
 pub fn generate_hidden_includes(unique_id: &str, def_crate: &str) -> TokenStream {
-	if ::std::env::var("CARGO_PKG_NAME").unwrap() == def_crate {
+	if std::env::var("CARGO_PKG_NAME").unwrap() == def_crate {
 		TokenStream::new()
 	} else {
 		let mod_name = generate_hidden_includes_mod_name(unique_id);

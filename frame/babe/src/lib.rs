@@ -1,45 +1,51 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Consensus extension module for BABE consensus. Collects on-chain randomness
 //! from VRF outputs and manages epoch transitions.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unused_must_use, unsafe_code, unused_variables, unused_must_use)]
-#![deny(unused_imports)]
-pub use timestamp;
-use sp_timestamp;
+#![warn(unused_must_use, unsafe_code, unused_variables, unused_must_use)]
 
-use rstd::{result, prelude::*};
-use support::{decl_storage, decl_module, traits::FindAuthor, traits::Get};
+use pallet_timestamp;
+
+use sp_std::{result, prelude::*};
+use frame_support::{
+	decl_storage, decl_module, traits::{FindAuthor, Get, Randomness as RandomnessT},
+	weights::Weight,
+};
 use sp_timestamp::OnTimestampSet;
-use sr_primitives::{generic::DigestItem, ConsensusEngineId, Perbill};
-use sr_primitives::traits::{IsMember, SaturatedConversion, Saturating, RandomnessBeacon};
-use sr_staking_primitives::{
+use sp_runtime::{generic::DigestItem, ConsensusEngineId, Perbill};
+use sp_runtime::traits::{IsMember, SaturatedConversion, Saturating, Hash, One};
+use sp_staking::{
 	SessionIndex,
 	offence::{Offence, Kind},
 };
+use sp_application_crypto::Public;
 
 use codec::{Encode, Decode};
-use inherents::{InherentIdentifier, InherentData, ProvideInherent, MakeFatalError};
-use babe_primitives::{
-	BABE_ENGINE_ID, ConsensusLog, BabeAuthorityWeight, NextEpochDescriptor, RawBabePreDigest,
-	SlotNumber, inherents::{INHERENT_IDENTIFIER, BabeInherentData}
+use sp_inherents::{InherentIdentifier, InherentData, ProvideInherent, MakeFatalError};
+use sp_consensus_babe::{
+	BABE_ENGINE_ID, ConsensusLog, BabeAuthorityWeight, SlotNumber,
+	inherents::{INHERENT_IDENTIFIER, BabeInherentData},
+	digests::{NextEpochDescriptor, NextConfigDescriptor, PreDigest},
 };
-pub use babe_primitives::{AuthorityId, VRF_OUTPUT_LENGTH, PUBLIC_KEY_LENGTH};
+use sp_consensus_vrf::schnorrkel;
+pub use sp_consensus_babe::{AuthorityId, VRF_OUTPUT_LENGTH, RANDOMNESS_LENGTH, PUBLIC_KEY_LENGTH};
 
 #[cfg(all(feature = "std", test))]
 mod tests;
@@ -47,7 +53,7 @@ mod tests;
 #[cfg(all(feature = "std", test))]
 mod mock;
 
-pub trait Trait: timestamp::Trait {
+pub trait Trait: pallet_timestamp::Trait {
 	/// The amount of time, in slots, that each epoch should last.
 	type EpochDuration: Get<SlotNumber>;
 
@@ -96,12 +102,9 @@ impl EpochChangeTrigger for SameAuthoritiesForever {
 	}
 }
 
-/// The length of the BABE randomness
-pub const RANDOMNESS_LENGTH: usize = 32;
-
 const UNDER_CONSTRUCTION_SEGMENT_LENGTH: usize = 256;
 
-type MaybeVrf = Option<[u8; 32 /* VRF_OUTPUT_LENGTH */]>;
+type MaybeRandomness = Option<schnorrkel::Randomness>;
 
 decl_storage! {
 	trait Store for Module<T: Trait> as Babe {
@@ -131,10 +134,13 @@ decl_storage! {
 		// NOTE: the following fields don't use the constants to define the
 		// array size because the metadata API currently doesn't resolve the
 		// variable to its underlying value.
-		pub Randomness get(fn randomness): [u8; 32 /* RANDOMNESS_LENGTH */];
+		pub Randomness get(fn randomness): schnorrkel::Randomness;
+
+		/// Next epoch configuration, if changed.
+		NextEpochConfig: Option<NextConfigDescriptor>;
 
 		/// Next epoch randomness.
-		NextRandomness: [u8; 32 /* RANDOMNESS_LENGTH */];
+		NextRandomness: schnorrkel::Randomness;
 
 		/// Randomness under construction.
 		///
@@ -146,11 +152,18 @@ decl_storage! {
 		/// We reset all segments and return to `0` at the beginning of every
 		/// epoch.
 		SegmentIndex build(|_| 0): u32;
-		UnderConstruction: map u32 => Vec<[u8; 32 /* VRF_OUTPUT_LENGTH */]>;
+		UnderConstruction: map hasher(twox_64_concat) u32 => Vec<schnorrkel::Randomness>;
 
 		/// Temporary value (cleared at block finalization) which is `Some`
 		/// if per-block initialization has already been called for current block.
-		Initialized get(fn initialized): Option<MaybeVrf>;
+		Initialized get(fn initialized): Option<MaybeRandomness>;
+
+		/// How late the current block is compared to its parent.
+		///
+		/// This entry is populated as part of block execution and is cleaned up
+		/// on block finalization. Querying this storage entry outside of block
+		/// execution context should always yield zero.
+		Lateness get(fn lateness): T::BlockNumber;
 	}
 	add_extra_genesis {
 		config(authorities): Vec<(AuthorityId, BabeAuthorityWeight)>;
@@ -159,7 +172,7 @@ decl_storage! {
 }
 
 decl_module! {
-	/// The BABE SRML module
+	/// The BABE Pallet
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
 		/// The number of **slots** that an epoch takes. We couple sessions to
 		/// epochs, i.e. we start a new session once the new epoch begins.
@@ -173,8 +186,10 @@ decl_module! {
 		const ExpectedBlockTime: T::Moment = T::ExpectedBlockTime::get();
 
 		/// Initialization
-		fn on_initialize(now: T::BlockNumber) {
+		fn on_initialize(now: T::BlockNumber) -> Weight {
 			Self::do_initialize(now);
+
+			0
 		}
 
 		/// Block finalization
@@ -184,16 +199,38 @@ decl_module! {
 			// that this block was the first in a new epoch, the changeover logic has
 			// already occurred at this point, so the under-construction randomness
 			// will only contain outputs from the right epoch.
-			if let Some(Some(vrf_output)) = Initialized::take() {
-				Self::deposit_vrf_output(&vrf_output);
+			if let Some(Some(randomness)) = Initialized::take() {
+				Self::deposit_randomness(&randomness);
 			}
+
+			// remove temporary "environment" entry from storage
+			Lateness::<T>::kill();
 		}
 	}
 }
 
-impl<T: Trait> RandomnessBeacon for Module<T> {
-	fn random() -> [u8; VRF_OUTPUT_LENGTH] {
-		Self::randomness()
+impl<T: Trait> RandomnessT<<T as frame_system::Trait>::Hash> for Module<T> {
+	/// Some BABE blocks have VRF outputs where the block producer has exactly one bit of influence,
+	/// either they make the block or they do not make the block and thus someone else makes the
+	/// next block. Yet, this randomness is not fresh in all BABE blocks.
+	///
+	/// If that is an insufficient security guarantee then two things can be used to improve this
+	/// randomness:
+	///
+	/// - Name, in advance, the block number whose random value will be used; ensure your module
+	///   retains a buffer of previous random values for its subject and then index into these in
+	///   order to obviate the ability of your user to look up the parent hash and choose when to
+	///   transact based upon it.
+	/// - Require your user to first commit to an additional value by first posting its hash.
+	///   Require them to reveal the value to determine the final result, hashing it with the
+	///   output of this random function. This reduces the ability of a cabal of block producers
+	///   from conspiring against individuals.
+	fn random(subject: &[u8]) -> T::Hash {
+		let mut subject = subject.to_vec();
+		subject.reserve(VRF_OUTPUT_LENGTH);
+		subject.extend_from_slice(&Self::randomness()[..]);
+
+		<T as frame_system::Trait>::Hashing::hash(&subject[..])
 	}
 }
 
@@ -206,13 +243,8 @@ impl<T: Trait> FindAuthor<u32> for Module<T> {
 	{
 		for (id, mut data) in digests.into_iter() {
 			if id == BABE_ENGINE_ID {
-				let pre_digest = RawBabePreDigest::decode(&mut data).ok()?;
-				return Some(match pre_digest {
-					RawBabePreDigest::Primary { authority_index, .. } =>
-						authority_index,
-					RawBabePreDigest::Secondary { authority_index, .. } =>
-						authority_index,
-				});
+				let pre_digest: PreDigest = PreDigest::decode(&mut data).ok()?;
+				return Some(pre_digest.authority_index())
 			}
 		}
 
@@ -228,11 +260,11 @@ impl<T: Trait> IsMember<AuthorityId> for Module<T> {
 	}
 }
 
-impl<T: Trait> session::ShouldEndSession<T::BlockNumber> for Module<T> {
+impl<T: Trait> pallet_session::ShouldEndSession<T::BlockNumber> for Module<T> {
 	fn should_end_session(now: T::BlockNumber) -> bool {
 		// it might be (and it is in current implementation) that session module is calling
 		// should_end_session() from it's own on_initialize() handler
-		// => because session on_initialize() is called earlier than ours, let's ensure
+		// => because pallet_session on_initialize() is called earlier than ours, let's ensure
 		// that we have synced with digest before checking if session should be ended.
 		Self::do_initialize(now);
 
@@ -240,20 +272,18 @@ impl<T: Trait> session::ShouldEndSession<T::BlockNumber> for Module<T> {
 	}
 }
 
-// TODO [slashing]: @marcio use this, remove the dead_code annotation.
 /// A BABE equivocation offence report.
 ///
 /// When a validator released two or more blocks at the same slot.
-#[allow(dead_code)]
-struct BabeEquivocationOffence<FullIdentification> {
+pub struct BabeEquivocationOffence<FullIdentification> {
 	/// A babe slot number in which this incident happened.
-	slot: u64,
+	pub slot: u64,
 	/// The session index in which the incident happened.
-	session_index: SessionIndex,
+	pub session_index: SessionIndex,
 	/// The size of the validator set at the time of the offence.
-	validator_set_count: u32,
+	pub validator_set_count: u32,
 	/// The authority that produced the equivocation.
-	offender: FullIdentification,
+	pub offender: FullIdentification,
 }
 
 impl<FullIdentification: Clone> Offence<FullIdentification> for BabeEquivocationOffence<FullIdentification> {
@@ -292,7 +322,7 @@ impl<T: Trait> Module<T> {
 	pub fn slot_duration() -> T::Moment {
 		// we double the minimum block-period so each author can always propose within
 		// the majority of their slot.
-		<T as timestamp::Trait>::MinimumPeriod::get().saturating_mul(2.into())
+		<T as pallet_timestamp::Trait>::MinimumPeriod::get().saturating_mul(2.into())
 	}
 
 	/// Determine whether an epoch change should take place at this block.
@@ -306,10 +336,44 @@ impl<T: Trait> Module<T> {
 		// epoch 0 as having started at the slot of block 1. We want to use
 		// the same randomness and validator set as signalled in the genesis,
 		// so we don't rotate the epoch.
-		now != sr_primitives::traits::One::one() && {
+		now != One::one() && {
 			let diff = CurrentSlot::get().saturating_sub(Self::current_epoch_start());
 			diff >= T::EpochDuration::get()
 		}
+	}
+
+	/// Return the _best guess_ block number, at which the next epoch change is predicted to happen.
+	///
+	/// Returns None if the prediction is in the past; This implies an error internally in the Babe
+	/// and should not happen under normal circumstances.
+	///
+	/// In other word, this is only accurate if no slots are missed. Given missed slots, the slot
+	/// number will grow while the block number will not. Hence, the result can be interpreted as an
+	/// upper bound.
+	// -------------- IMPORTANT NOTE --------------
+	// This implementation is linked to how [`should_epoch_change`] is working. This might need to
+	// be updated accordingly, if the underlying mechanics of slot and epochs change.
+	//
+	// WEIGHT NOTE: This function is tied to the weight of `EstimateNextSessionRotation`. If you update
+	// this function, you must also update the corresponding weight.
+	pub fn next_expected_epoch_change(now: T::BlockNumber) -> Option<T::BlockNumber> {
+		let next_slot = Self::current_epoch_start().saturating_add(T::EpochDuration::get());
+		next_slot
+			.checked_sub(CurrentSlot::get())
+			.map(|slots_remaining| {
+				// This is a best effort guess. Drifts in the slot/block ratio will cause errors here.
+				let blocks_remaining: T::BlockNumber = slots_remaining.saturated_into();
+				now.saturating_add(blocks_remaining)
+			})
+	}
+
+	/// Plan an epoch config change. The epoch config change is recorded and will be enacted on the
+	/// next call to `enact_epoch_change`. The config will be activated one epoch after. Multiple calls to this
+	/// method will replace any existing planned config change that had not been enacted yet.
+	pub fn plan_config_change(
+		config: NextConfigDescriptor,
+	) {
+		NextEpochConfig::put(config);
 	}
 
 	/// DANGEROUS: Enact an epoch change. Should be done on every block where `should_epoch_change` has returned `true`,
@@ -323,10 +387,7 @@ impl<T: Trait> Module<T> {
 	) {
 		// PRECONDITION: caller has done initialization and is guaranteed
 		// by the session module to be called before this.
-		#[cfg(debug_assertions)]
-		{
-			assert!(Self::initialized().is_some())
-		}
+		debug_assert!(Self::initialized().is_some());
 
 		// Update epoch index
 		let epoch_index = EpochIndex::get()
@@ -350,37 +411,40 @@ impl<T: Trait> Module<T> {
 		// so that nodes can track changes.
 		let next_randomness = NextRandomness::get();
 
-		let next = NextEpochDescriptor {
+		let next_epoch = NextEpochDescriptor {
 			authorities: next_authorities,
 			randomness: next_randomness,
 		};
+		Self::deposit_consensus(ConsensusLog::NextEpochData(next_epoch));
 
-		Self::deposit_consensus(ConsensusLog::NextEpochData(next))
+		if let Some(next_config) = NextEpochConfig::take() {
+			Self::deposit_consensus(ConsensusLog::NextConfigData(next_config));
+		}
 	}
 
 	// finds the start slot of the current epoch. only guaranteed to
 	// give correct results after `do_initialize` of the first block
 	// in the chain (as its result is based off of `GenesisSlot`).
-	fn current_epoch_start() -> SlotNumber {
+	pub fn current_epoch_start() -> SlotNumber {
 		(EpochIndex::get() * T::EpochDuration::get()) + GenesisSlot::get()
 	}
 
 	fn deposit_consensus<U: Encode>(new: U) {
 		let log: DigestItem<T::Hash> = DigestItem::Consensus(BABE_ENGINE_ID, new.encode());
-		<system::Module<T>>::deposit_log(log.into())
+		<frame_system::Module<T>>::deposit_log(log.into())
 	}
 
-	fn deposit_vrf_output(vrf_output: &[u8; VRF_OUTPUT_LENGTH]) {
+	fn deposit_randomness(randomness: &schnorrkel::Randomness) {
 		let segment_idx = <SegmentIndex>::get();
 		let mut segment = <UnderConstruction>::get(&segment_idx);
 		if segment.len() < UNDER_CONSTRUCTION_SEGMENT_LENGTH {
 			// push onto current segment: not full.
-			segment.push(*vrf_output);
+			segment.push(*randomness);
 			<UnderConstruction>::insert(&segment_idx, &segment);
 		} else {
 			// move onto the next segment and update the index.
 			let segment_idx = segment_idx + 1;
-			<UnderConstruction>::insert(&segment_idx, &vec![*vrf_output]);
+			<UnderConstruction>::insert(&segment_idx, &vec![randomness.clone()]);
 			<SegmentIndex>::put(&segment_idx);
 		}
 	}
@@ -393,18 +457,18 @@ impl<T: Trait> Module<T> {
 			return;
 		}
 
-		let maybe_pre_digest = <system::Module<T>>::digest()
+		let maybe_pre_digest: Option<PreDigest> = <frame_system::Module<T>>::digest()
 			.logs
 			.iter()
 			.filter_map(|s| s.as_pre_runtime())
 			.filter_map(|(id, mut data)| if id == BABE_ENGINE_ID {
-				RawBabePreDigest::decode(&mut data).ok()
+				PreDigest::decode(&mut data).ok()
 			} else {
 				None
 			})
 			.next();
 
-		let maybe_vrf = maybe_pre_digest.and_then(|digest| {
+		let maybe_randomness: Option<schnorrkel::Randomness> = maybe_pre_digest.and_then(|digest| {
 			// on the first non-zero block (i.e. block #1)
 			// this is where the first epoch (epoch #0) actually starts.
 			// we need to adjust internal storage accordingly.
@@ -423,19 +487,48 @@ impl<T: Trait> Module<T> {
 				Self::deposit_consensus(ConsensusLog::NextEpochData(next))
 			}
 
-			CurrentSlot::put(digest.slot_number());
+			// the slot number of the current block being initialized
+			let current_slot = digest.slot_number();
 
-			if let RawBabePreDigest::Primary { vrf_output, .. } = digest {
+			// how many slots were skipped between current and last block
+			let lateness = current_slot.saturating_sub(CurrentSlot::get() + 1);
+			let lateness = T::BlockNumber::from(lateness as u32);
+
+			Lateness::<T>::put(lateness);
+			CurrentSlot::put(current_slot);
+
+			if let PreDigest::Primary(primary) = digest {
 				// place the VRF output into the `Initialized` storage item
 				// and it'll be put onto the under-construction randomness
 				// later, once we've decided which epoch this block is in.
-				Some(vrf_output)
+				//
+				// Reconstruct the bytes of VRFInOut using the authority id.
+				Authorities::get()
+					.get(primary.authority_index as usize)
+					.and_then(|author| {
+						schnorrkel::PublicKey::from_bytes(author.0.as_slice()).ok()
+					})
+					.and_then(|pubkey| {
+						let transcript = sp_consensus_babe::make_transcript(
+							&Self::randomness(),
+							current_slot,
+							EpochIndex::get(),
+						);
+
+						primary.vrf_output.0.attach_input_hash(
+							&pubkey,
+							transcript
+						).ok()
+					})
+					.map(|inout| {
+						inout.make_bytes(&sp_consensus_babe::BABE_VRF_INOUT_CONTEXT)
+					})
 			} else {
 				None
 			}
 		});
 
-		Initialized::put(maybe_vrf);
+		Initialized::put(maybe_randomness);
 
 		// enact epoch change, if necessary.
 		T::EpochChangeTrigger::trigger::<T>(now)
@@ -443,9 +536,9 @@ impl<T: Trait> Module<T> {
 
 	/// Call this function exactly once when an epoch changes, to update the
 	/// randomness. Returns the new randomness.
-	fn randomness_change_epoch(next_epoch_index: u64) -> [u8; RANDOMNESS_LENGTH] {
+	fn randomness_change_epoch(next_epoch_index: u64) -> schnorrkel::Randomness {
 		let this_randomness = NextRandomness::get();
-		let segment_idx: u32 = <SegmentIndex>::mutate(|s| rstd::mem::replace(s, 0));
+		let segment_idx: u32 = <SegmentIndex>::mutate(|s| sp_std::mem::replace(s, 0));
 
 		// overestimate to the segment being full.
 		let rho_size = segment_idx.saturating_add(1) as usize * UNDER_CONSTRUCTION_SEGMENT_LENGTH;
@@ -472,11 +565,29 @@ impl<T: Trait> OnTimestampSet<T::Moment> for Module<T> {
 	fn on_timestamp_set(_moment: T::Moment) { }
 }
 
-impl<T: Trait> sr_primitives::BoundToRuntimeAppPublic for Module<T> {
+impl<T: Trait> frame_support::traits::EstimateNextSessionRotation<T::BlockNumber> for Module<T> {
+	fn estimate_next_session_rotation(now: T::BlockNumber) -> Option<T::BlockNumber> {
+		Self::next_expected_epoch_change(now)
+	}
+
+	// The validity of this weight depends on the implementation of `estimate_next_session_rotation`
+	fn weight(_now: T::BlockNumber) -> Weight {
+		// Read: Current Slot, Epoch Index, Genesis Slot
+		T::DbWeight::get().reads(3)
+	}
+}
+
+impl<T: Trait> frame_support::traits::Lateness<T::BlockNumber> for Module<T> {
+	fn lateness(&self) -> T::BlockNumber {
+		Self::lateness()
+	}
+}
+
+impl<T: Trait> sp_runtime::BoundToRuntimeAppPublic for Module<T> {
 	type Public = AuthorityId;
 }
 
-impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T> {
+impl<T: Trait> pallet_session::OneSessionHandler<T::AccountId> for Module<T> {
 	type Key = AuthorityId;
 
 	fn on_genesis_session<'a, I: 'a>(validators: I)
@@ -510,11 +621,11 @@ impl<T: Trait> session::OneSessionHandler<T::AccountId> for Module<T> {
 //
 // an optional size hint as to how many VRF outputs there were may be provided.
 fn compute_randomness(
-	last_epoch_randomness: [u8; RANDOMNESS_LENGTH],
+	last_epoch_randomness: schnorrkel::Randomness,
 	epoch_index: u64,
-	rho: impl Iterator<Item=[u8; VRF_OUTPUT_LENGTH]>,
+	rho: impl Iterator<Item=schnorrkel::Randomness>,
 	rho_size_hint: Option<usize>,
-) -> [u8; RANDOMNESS_LENGTH] {
+) -> schnorrkel::Randomness {
 	let mut s = Vec::with_capacity(40 + rho_size_hint.unwrap_or(0) * VRF_OUTPUT_LENGTH);
 	s.extend_from_slice(&last_epoch_randomness);
 	s.extend_from_slice(&epoch_index.to_le_bytes());
@@ -523,12 +634,12 @@ fn compute_randomness(
 		s.extend_from_slice(&vrf_output[..]);
 	}
 
-	runtime_io::hashing::blake2_256(&s)
+	sp_io::hashing::blake2_256(&s)
 }
 
 impl<T: Trait> ProvideInherent for Module<T> {
-	type Call = timestamp::Call<T>;
-	type Error = MakeFatalError<inherents::Error>;
+	type Call = pallet_timestamp::Call<T>;
+	type Error = MakeFatalError<sp_inherents::Error>;
 	const INHERENT_IDENTIFIER: InherentIdentifier = INHERENT_IDENTIFIER;
 
 	fn create_inherent(_: &InherentData) -> Option<Self::Call> {
@@ -537,7 +648,7 @@ impl<T: Trait> ProvideInherent for Module<T> {
 
 	fn check_inherent(call: &Self::Call, data: &InherentData) -> result::Result<(), Self::Error> {
 		let timestamp = match call {
-			timestamp::Call::set(ref timestamp) => timestamp.clone(),
+			pallet_timestamp::Call::set(ref timestamp) => timestamp.clone(),
 			_ => return Ok(()),
 		};
 
@@ -547,7 +658,7 @@ impl<T: Trait> ProvideInherent for Module<T> {
 		if timestamp_based_slot == seal_slot {
 			Ok(())
 		} else {
-			Err(inherents::Error::from("timestamp set in block doesn't match slot in seal").into())
+			Err(sp_inherents::Error::from("timestamp set in block doesn't match slot in seal").into())
 		}
 	}
 }

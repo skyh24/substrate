@@ -1,18 +1,19 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! # Assets Module
 //!
@@ -84,22 +85,24 @@
 //! ### Simple Code Snippet
 //!
 //! ```rust,ignore
-//! use support::{decl_module, dispatch::Result};
-//! use system::ensure_signed;
+//! use pallet_assets as assets;
+//! use frame_support::{decl_module, dispatch, ensure};
+//! use frame_system::{self as system, ensure_signed};
 //!
 //! pub trait Trait: assets::Trait { }
 //!
 //! decl_module! {
 //! 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-//! 		pub fn issue_token_airdrop(origin) -> Result {
+//! 		pub fn issue_token_airdrop(origin) -> dispatch::DispatchResult {
+//! 			let sender = ensure_signed(origin).map_err(|e| e.as_str())?;
+//!
 //! 			const ACCOUNT_ALICE: u64 = 1;
 //! 			const ACCOUNT_BOB: u64 = 2;
-//! 			const COUNT_AIRDROP_RECIPIENTS = 2;
+//! 			const COUNT_AIRDROP_RECIPIENTS: u64 = 2;
 //! 			const TOKENS_FIXED_SUPPLY: u64 = 100;
 //!
 //! 			ensure!(!COUNT_AIRDROP_RECIPIENTS.is_zero(), "Divide by zero error.");
 //!
-//! 			let sender = ensure_signed(origin)?;
 //! 			let asset_id = Self::next_asset_id();
 //!
 //! 			<NextAssetId<T>>::mutate(|asset_id| *asset_id += 1);
@@ -130,29 +133,39 @@
 // Ensure we're `no_std` when compiling for Wasm.
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use support::{Parameter, decl_module, decl_event, decl_storage, ensure};
-use sr_primitives::traits::{Member, SimpleArithmetic, Zero, StaticLookup};
-use system::ensure_signed;
-use sr_primitives::traits::One;
+use frame_support::{Parameter, decl_module, decl_event, decl_storage, decl_error, ensure};
+use sp_runtime::traits::{Member, AtLeast32Bit, Zero, StaticLookup};
+use frame_system::{self as system, ensure_signed};
+use sp_runtime::traits::One;
 
 /// The module configuration trait.
-pub trait Trait: system::Trait {
+pub trait Trait: frame_system::Trait {
 	/// The overarching event type.
-	type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
+	type Event: From<Event<Self>> + Into<<Self as frame_system::Trait>::Event>;
 
 	/// The units in which we record balances.
-	type Balance: Member + Parameter + SimpleArithmetic + Default + Copy;
+	type Balance: Member + Parameter + AtLeast32Bit + Default + Copy;
 
 	/// The arithmetic type of asset identifier.
-	type AssetId: Parameter + SimpleArithmetic + Default + Copy;
+	type AssetId: Parameter + AtLeast32Bit + Default + Copy;
 }
 
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
+		type Error = Error<T>;
+
 		fn deposit_event() = default;
 		/// Issue a new class of fungible assets. There are, and will only ever be, `total`
 		/// such assets and they'll all belong to the `origin` initially. It will have an
 		/// identifier `AssetId` instance: this will be specified in the `Issued` event.
+		///
+		/// # <weight>
+		/// - `O(1)`
+		/// - 1 storage mutation (codec `O(1)`).
+		/// - 2 storage writes (condec `O(1)`).
+		/// - 1 event.
+		/// # </weight>
+		#[weight = 0]
 		fn issue(origin, #[compact] total: T::Balance) {
 			let origin = ensure_signed(origin)?;
 
@@ -166,6 +179,14 @@ decl_module! {
 		}
 
 		/// Move some assets from one holder to another.
+		///
+		/// # <weight>
+		/// - `O(1)`
+		/// - 1 static lookup
+		/// - 2 storage mutations (codec `O(1)`).
+		/// - 1 event.
+		/// # </weight>
+		#[weight = 0]
 		fn transfer(origin,
 			#[compact] id: T::AssetId,
 			target: <T::Lookup as StaticLookup>::Source,
@@ -175,8 +196,8 @@ decl_module! {
 			let origin_account = (id, origin.clone());
 			let origin_balance = <Balances<T>>::get(&origin_account);
 			let target = T::Lookup::lookup(target)?;
-			ensure!(!amount.is_zero(), "transfer amount should be non-zero");
-			ensure!(origin_balance >= amount, "origin account balance must be greater than or equal to the transfer amount");
+			ensure!(!amount.is_zero(), Error::<T>::AmountZero);
+			ensure!(origin_balance >= amount, Error::<T>::BalanceLow);
 
 			Self::deposit_event(RawEvent::Transferred(id, origin, target.clone(), amount));
 			<Balances<T>>::insert(origin_account, origin_balance - amount);
@@ -184,10 +205,18 @@ decl_module! {
 		}
 
 		/// Destroy any assets of `id` owned by `origin`.
+		///
+		/// # <weight>
+		/// - `O(1)`
+		/// - 1 storage mutation (codec `O(1)`).
+		/// - 1 storage deletion (codec `O(1)`).
+		/// - 1 event.
+		/// # </weight>
+		#[weight = 0]
 		fn destroy(origin, #[compact] id: T::AssetId) {
 			let origin = ensure_signed(origin)?;
 			let balance = <Balances<T>>::take((id, &origin));
-			ensure!(!balance.is_zero(), "origin balance should be non-zero");
+			ensure!(!balance.is_zero(), Error::<T>::BalanceZero);
 
 			<TotalSupply<T>>::mutate(id, |total_supply| *total_supply -= balance);
 			Self::deposit_event(RawEvent::Destroyed(id, origin, balance));
@@ -195,9 +224,9 @@ decl_module! {
 	}
 }
 
-decl_event!(
+decl_event! {
 	pub enum Event<T> where
-		<T as system::Trait>::AccountId,
+		<T as frame_system::Trait>::AccountId,
 		<T as Trait>::Balance,
 		<T as Trait>::AssetId,
 	{
@@ -208,16 +237,27 @@ decl_event!(
 		/// Some assets were destroyed.
 		Destroyed(AssetId, AccountId, Balance),
 	}
-);
+}
+
+decl_error! {
+	pub enum Error for Module<T: Trait> {
+		/// Transfer amount should be non-zero
+		AmountZero,
+		/// Account balance must be greater than or equal to the transfer amount
+		BalanceLow,
+		/// Balance should be non-zero
+		BalanceZero,
+	}
+}
 
 decl_storage! {
 	trait Store for Module<T: Trait> as Assets {
 		/// The number of units of assets held by any given account.
-		Balances: map (T::AssetId, T::AccountId) => T::Balance;
+		Balances: map hasher(blake2_128_concat) (T::AssetId, T::AccountId) => T::Balance;
 		/// The next asset identifier up for grabs.
 		NextAssetId get(fn next_asset_id): T::AssetId;
 		/// The total unit supply of an asset.
-		TotalSupply: map T::AssetId => T::Balance;
+		TotalSupply: map hasher(twox_64_concat) T::AssetId => T::Balance;
 	}
 }
 
@@ -240,28 +280,28 @@ impl<T: Trait> Module<T> {
 mod tests {
 	use super::*;
 
-	use support::{impl_outer_origin, assert_ok, assert_noop, parameter_types};
-	use primitives::H256;
+	use frame_support::{impl_outer_origin, assert_ok, assert_noop, parameter_types, weights::Weight};
+	use sp_core::H256;
 	// The testing primitives are very useful for avoiding having to work with signatures
 	// or public keys. `u64` is used as the `AccountId` and no `Signature`s are required.
-	use sr_primitives::{Perbill, traits::{BlakeTwo256, IdentityLookup}, testing::Header};
+	use sp_runtime::{Perbill, traits::{BlakeTwo256, IdentityLookup}, testing::Header};
 
 	impl_outer_origin! {
-		pub enum Origin for Test {}
+		pub enum Origin for Test  where system = frame_system {}
 	}
 
-	// For testing the module, we construct most of a mock runtime. This means
+	// For testing the pallet, we construct most of a mock runtime. This means
 	// first constructing a configuration type (`Test`) which `impl`s each of the
-	// configuration traits of modules we want to use.
+	// configuration traits of pallets we want to use.
 	#[derive(Clone, Eq, PartialEq)]
 	pub struct Test;
 	parameter_types! {
 		pub const BlockHashCount: u64 = 250;
-		pub const MaximumBlockWeight: u32 = 1024;
+		pub const MaximumBlockWeight: Weight = 1024;
 		pub const MaximumBlockLength: u32 = 2 * 1024;
 		pub const AvailableBlockRatio: Perbill = Perbill::one();
 	}
-	impl system::Trait for Test {
+	impl frame_system::Trait for Test {
 		type Origin = Origin;
 		type Index = u64;
 		type Call = ();
@@ -274,9 +314,17 @@ mod tests {
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
 		type MaximumBlockWeight = MaximumBlockWeight;
+		type DbWeight = ();
+		type BlockExecutionWeight = ();
+		type ExtrinsicBaseWeight = ();
+		type MaximumExtrinsicWeight = MaximumBlockWeight;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
+		type ModuleToIndex = ();
+		type AccountData = ();
+		type OnNewAccount = ();
+		type OnKilledAccount = ();
 	}
 	impl Trait for Test {
 		type Event = ();
@@ -287,8 +335,8 @@ mod tests {
 
 	// This function basically just builds a genesis storage key/value store according to
 	// our desired mockup.
-	fn new_test_ext() -> runtime_io::TestExternalities {
-		system::GenesisConfig::default().build_storage::<Test>().unwrap().into()
+	fn new_test_ext() -> sp_io::TestExternalities {
+		frame_system::GenesisConfig::default().build_storage::<Test>().unwrap().into()
 	}
 
 	#[test]
@@ -337,7 +385,7 @@ mod tests {
 			assert_eq!(Assets::balance(0, 2), 50);
 			assert_ok!(Assets::destroy(Origin::signed(1), 0));
 			assert_eq!(Assets::balance(0, 1), 0);
-			assert_noop!(Assets::transfer(Origin::signed(1), 0, 1, 50), "origin account balance must be greater than or equal to the transfer amount");
+			assert_noop!(Assets::transfer(Origin::signed(1), 0, 1, 50), Error::<Test>::BalanceLow);
 		});
 	}
 
@@ -346,7 +394,7 @@ mod tests {
 		new_test_ext().execute_with(|| {
 			assert_ok!(Assets::issue(Origin::signed(1), 100));
 			assert_eq!(Assets::balance(0, 1), 100);
-			assert_noop!(Assets::transfer(Origin::signed(1), 0, 2, 0), "transfer amount should be non-zero");
+			assert_noop!(Assets::transfer(Origin::signed(1), 0, 2, 0), Error::<Test>::AmountZero);
 		});
 	}
 
@@ -355,7 +403,7 @@ mod tests {
 		new_test_ext().execute_with(|| {
 			assert_ok!(Assets::issue(Origin::signed(1), 100));
 			assert_eq!(Assets::balance(0, 1), 100);
-			assert_noop!(Assets::transfer(Origin::signed(1), 0, 2, 101), "origin account balance must be greater than or equal to the transfer amount");
+			assert_noop!(Assets::transfer(Origin::signed(1), 0, 2, 101), Error::<Test>::BalanceLow);
 		});
 	}
 
@@ -373,7 +421,7 @@ mod tests {
 		new_test_ext().execute_with(|| {
 			assert_ok!(Assets::issue(Origin::signed(1), 100));
 			assert_eq!(Assets::balance(0, 2), 0);
-			assert_noop!(Assets::destroy(Origin::signed(2), 0), "origin balance should be non-zero");
+			assert_noop!(Assets::destroy(Origin::signed(2), 0), Error::<Test>::BalanceZero);
 		});
 	}
 }

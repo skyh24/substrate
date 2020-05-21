@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -20,19 +20,20 @@ use std::sync::Arc;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 
-use sr_primitives::{
-    traits::{
-        Block as BlockT, Header as HeaderT, NumberFor,
-    },
-    generic::BlockId
+use sp_runtime::{
+	traits::{
+		Block as BlockT, Header as HeaderT, NumberFor,
+	},
+	generic::BlockId
 };
-use primitives::{ChangesTrieConfiguration};
-use state_machine::StorageProof;
+use sp_core::{ChangesTrieConfigurationRange, storage::PrefixedStorageKey};
+use sp_state_machine::StorageProof;
 use sp_blockchain::{
 	HeaderMetadata, well_known_cache_keys, HeaderBackend, Cache as BlockchainCache,
 	Error as ClientError, Result as ClientResult,
 };
-use crate::backend::{ AuxStore, NewBlockState };
+use crate::{backend::{AuxStore, NewBlockState}, UsageInfo};
+
 /// Remote call request.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RemoteCallRequest<Header: HeaderT> {
@@ -80,7 +81,7 @@ pub struct RemoteReadChildRequest<Header: HeaderT> {
 	/// Header of block at which read is performed.
 	pub header: Header,
 	/// Storage key for child.
-	pub storage_key: Vec<u8>,
+	pub storage_key: PrefixedStorageKey,
 	/// Child storage key to read.
 	pub keys: Vec<Vec<u8>>,
 	/// Number of times to retry request. None means that default RETRY_COUNT is used.
@@ -90,8 +91,8 @@ pub struct RemoteReadChildRequest<Header: HeaderT> {
 /// Remote key changes read request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteChangesRequest<Header: HeaderT> {
-	/// Changes trie configuration.
-	pub changes_trie_config: ChangesTrieConfiguration,
+	/// All changes trie configurations that are valid within [first_block; last_block].
+	pub changes_trie_configs: Vec<ChangesTrieConfigurationRange<Header::Number, Header::Hash>>,
 	/// Query changes from range of blocks, starting (and including) with this hash...
 	pub first_block: (Header::Number, Header::Hash),
 	/// ...ending (and including) with this hash. Should come after first_block and
@@ -104,7 +105,7 @@ pub struct RemoteChangesRequest<Header: HeaderT> {
 	/// Proofs for roots of ascendants of tries_roots.0 are provided by the remote node.
 	pub tries_roots: (Header::Number, Header::Hash, Vec<Header::Hash>),
 	/// Optional Child Storage key to read.
-	pub storage_key: Option<Vec<u8>>,
+	pub storage_key: Option<PrefixedStorageKey>,
 	/// Storage key to read.
 	pub key: Vec<u8>,
 	/// Number of times to retry request. None means that default RETRY_COUNT is used.
@@ -139,15 +140,30 @@ pub struct RemoteBodyRequest<Header: HeaderT> {
 /// is correct (see FetchedDataChecker) and return already checked data.
 pub trait Fetcher<Block: BlockT>: Send + Sync {
 	/// Remote header future.
-	type RemoteHeaderResult: Future<Output = Result<Block::Header, ClientError>> + Send + 'static;
+	type RemoteHeaderResult: Future<Output = Result<
+		Block::Header,
+		ClientError,
+	>> + Unpin + Send + 'static;
 	/// Remote storage read future.
-	type RemoteReadResult: Future<Output = Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ClientError>> + Send + 'static;
+	type RemoteReadResult: Future<Output = Result<
+		HashMap<Vec<u8>, Option<Vec<u8>>>,
+		ClientError,
+	>> + Unpin + Send + 'static;
 	/// Remote call result future.
-	type RemoteCallResult: Future<Output = Result<Vec<u8>, ClientError>> + Send + 'static;
+	type RemoteCallResult: Future<Output = Result<
+		Vec<u8>,
+		ClientError,
+	>> + Unpin + Send + 'static;
 	/// Remote changes result future.
-	type RemoteChangesResult: Future<Output = Result<Vec<(NumberFor<Block>, u32)>, ClientError>> + Send + 'static;
+	type RemoteChangesResult: Future<Output = Result<
+		Vec<(NumberFor<Block>, u32)>,
+		ClientError,
+	>> + Unpin + Send + 'static;
 	/// Remote block body result future.
-	type RemoteBodyResult: Future<Output = Result<Vec<Block::Extrinsic>, ClientError>> + Send + 'static;
+	type RemoteBodyResult: Future<Output = Result<
+		Vec<Block::Extrinsic>,
+		ClientError,
+	>> + Unpin + Send + 'static;
 
 	/// Fetch remote header.
 	fn remote_header(&self, request: RemoteHeaderRequest<Block::Header>) -> Self::RemoteHeaderResult;
@@ -238,22 +254,25 @@ pub trait Storage<Block: BlockT>: AuxStore + HeaderBackend<Block> + HeaderMetada
 	/// Get last finalized header.
 	fn last_finalized(&self) -> ClientResult<Block::Hash>;
 
-	/// Get headers CHT root for given block. Fails if the block is not pruned (not a part of any CHT).
+	/// Get headers CHT root for given block. Returns None if the block is not pruned (not a part of any CHT).
 	fn header_cht_root(
 		&self,
 		cht_size: NumberFor<Block>,
 		block: NumberFor<Block>,
-	) -> ClientResult<Block::Hash>;
+	) -> ClientResult<Option<Block::Hash>>;
 
-	/// Get changes trie CHT root for given block. Fails if the block is not pruned (not a part of any CHT).
+	/// Get changes trie CHT root for given block. Returns None if the block is not pruned (not a part of any CHT).
 	fn changes_trie_cht_root(
 		&self,
 		cht_size: NumberFor<Block>,
 		block: NumberFor<Block>,
-	) -> ClientResult<Block::Hash>;
+	) -> ClientResult<Option<Block::Hash>>;
 
 	/// Get storage cache.
 	fn cache(&self) -> Option<Arc<dyn BlockchainCache<Block>>>;
+
+	/// Get storage usage statistics.
+	fn usage_info(&self) -> Option<UsageInfo>;
 }
 
 /// Remote header.
@@ -277,14 +296,32 @@ pub trait RemoteBlockchain<Block: BlockT>: Send + Sync {
 	>>;
 }
 
+/// Returns future that resolves header either locally, or remotely.
+pub fn future_header<Block: BlockT, F: Fetcher<Block>>(
+	blockchain: &dyn RemoteBlockchain<Block>,
+	fetcher: &F,
+	id: BlockId<Block>,
+) -> impl Future<Output = Result<Option<Block::Header>, ClientError>> {
+	use futures::future::{ready, Either, FutureExt};
 
+	match blockchain.header(id) {
+		Ok(LocalOrRemote::Remote(request)) => Either::Left(
+			fetcher
+				.remote_header(request)
+				.then(|header| ready(header.map(Some)))
+		),
+		Ok(LocalOrRemote::Unknown) => Either::Right(ready(Ok(None))),
+		Ok(LocalOrRemote::Local(local_header)) => Either::Right(ready(Ok(Some(local_header)))),
+		Err(err) => Either::Right(ready(Err(err))),
+	}
+}
 
 #[cfg(test)]
 pub mod tests {
 	use futures::future::Ready;
 	use parking_lot::Mutex;
-    use sp_blockchain::Error as ClientError;
-    use test_primitives::{Block, Header, Extrinsic};
+	use sp_blockchain::Error as ClientError;
+	use sp_test_primitives::{Block, Header, Extrinsic};
 	use super::*;
 
 	pub type OkCallFetcher = Mutex<Vec<u8>>;

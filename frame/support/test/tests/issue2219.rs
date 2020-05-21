@@ -1,23 +1,24 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
-
-use support::sr_primitives::generic;
-use support::sr_primitives::traits::{BlakeTwo256, Block as _, Verify};
-use support::codec::{Encode, Decode};
-use primitives::{H256, sr25519};
+use frame_support::sp_runtime::generic;
+use frame_support::sp_runtime::traits::{BlakeTwo256, Block as _, Verify};
+use frame_support::codec::{Encode, Decode};
+use sp_core::{H256, sr25519};
 use serde::{Serialize, Deserialize};
 
 mod system;
@@ -82,7 +83,7 @@ mod module {
 
 	pub trait Trait: system::Trait {}
 
-	support::decl_module! {
+	frame_support::decl_module! {
 		pub struct Module<T: Trait> for enum Call where origin: T::Origin {}
 	}
 
@@ -99,7 +100,7 @@ mod module {
 		}
 	}
 
-	support::decl_storage! {
+	frame_support::decl_storage! {
 		trait Store for Module<T: Trait> as Actors {
 			/// requirements to enter and maintain status in roles
 			pub Parameters get(fn parameters) build(|config: &GenesisConfig| {
@@ -109,7 +110,7 @@ mod module {
 				} else {
 					vec![]
 				}
-			}): map Role => Option<RoleParameters<T>>;
+			}): map hasher(blake2_128_concat) Role => Option<RoleParameters<T>>;
 
 			/// the roles members can enter into
 			pub AvailableRoles get(fn available_roles) build(|config: &GenesisConfig| {
@@ -124,10 +125,12 @@ mod module {
 			pub ActorAccountIds get(fn actor_account_ids) : Vec<T::AccountId>;
 
 			/// actor accounts associated with a role
-			pub AccountIdsByRole get(fn account_ids_by_role) : map Role => Vec<T::AccountId>;
+			pub AccountIdsByRole get(fn account_ids_by_role):
+				map hasher(blake2_128_concat) Role => Vec<T::AccountId>;
 
 			/// tokens locked until given block number
-			pub Bondage get(fn bondage) : map T::AccountId => T::BlockNumber;
+			pub Bondage get(fn bondage):
+				map hasher(blake2_128_concat) T::AccountId => T::BlockNumber;
 
 			/// First step before enter a role is registering intent with a new account/key.
 			/// This is done by sending a role_entry_request() from the new account.
@@ -160,17 +163,18 @@ impl system::Trait for Runtime {
 	type BlockNumber = BlockNumber;
 	type AccountId = AccountId;
 	type Event = Event;
+	type ModuleToIndex = ();
 }
 
 impl module::Trait for Runtime {}
 
-support::construct_runtime!(
+frame_support::construct_runtime!(
 	pub enum Runtime where
 		Block = Block,
 		NodeBlock = Block,
 		UncheckedExtrinsic = UncheckedExtrinsic
 	{
-		System: system::{Module, Call, Event},
+		System: system::{Module, Call, Event<T>},
 		Module: module::{Module, Call, Storage, Config},
 	}
 );

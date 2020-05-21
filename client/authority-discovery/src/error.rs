@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -16,12 +16,18 @@
 
 //! Authority discovery errors.
 
+use sp_core::crypto::CryptoTypePublicPair;
+
 /// AuthorityDiscovery Result.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error type for the authority discovery module.
 #[derive(Debug, derive_more::Display, derive_more::From)]
 pub enum Error {
+	/// Received dht value found event with records with different keys.
+	ReceivingDhtValueFoundEventWithDifferentKeys,
+	/// Received dht value found event with no records.
+	ReceivingDhtValueFoundEventWithNoRecords,
 	/// Failed to verify a dht payload with the given signature.
 	VerifyingDhtPayload,
 	/// Failed to hash the authority id to be used as a dht key.
@@ -38,8 +44,14 @@ pub enum Error {
 	EncodingProto(prost::EncodeError),
 	/// Failed to decode a protobuf payload.
 	DecodingProto(prost::DecodeError),
-	/// Failed to encode or decode scale payload
+	/// Failed to encode or decode scale payload.
 	EncodingDecodingScale(codec::Error),
 	/// Failed to parse a libp2p multi address.
 	ParsingMultiaddress(libp2p::core::multiaddr::Error),
+	/// Failed to sign using a specific public key.
+	MissingSignature(CryptoTypePublicPair),
+	/// Failed to sign using all public keys.
+	Signing,
+	/// Failed to register Prometheus metric.
+	Prometheus(prometheus_endpoint::PrometheusError),
 }

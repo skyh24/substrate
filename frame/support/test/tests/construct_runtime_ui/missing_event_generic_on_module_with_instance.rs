@@ -1,4 +1,4 @@
-use support::construct_runtime;
+use frame_support::construct_runtime;
 
 construct_runtime! {
 	pub enum Runtime where
@@ -6,7 +6,7 @@ construct_runtime! {
 		NodeBlock = Block,
 		UncheckedExtrinsic = UncheckedExtrinsic
 	{
-		System: system,
+		System: system::{Module},
 		Balance: balances::<Instance1>::{Event},
 	}
 }

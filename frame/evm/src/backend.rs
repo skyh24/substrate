@@ -1,13 +1,12 @@
-use rstd::marker::PhantomData;
-use rstd::vec::Vec;
+use sp_std::marker::PhantomData;
+use sp_std::vec::Vec;
 #[cfg(feature = "std")]
 use serde::{Serialize, Deserialize};
 use codec::{Encode, Decode};
-use primitives::{U256, H256, H160};
-use sr_primitives::traits::UniqueSaturatedInto;
-use support::storage::{StorageMap, StorageDoubleMap};
+use sp_core::{U256, H256, H160};
+use sp_runtime::traits::UniqueSaturatedInto;
+use frame_support::storage::{StorageMap, StorageDoubleMap};
 use sha3::{Keccak256, Digest};
-use evm::Config;
 use evm::backend::{Backend as BackendT, ApplyBackend, Apply};
 use crate::{Trait, Accounts, AccountStorages, AccountCodes, Module, Event};
 
@@ -29,7 +28,7 @@ pub struct Log {
 	pub address: H160,
 	/// Topics of the log.
 	pub topics: Vec<H256>,
-	/// Bytearray data of the log.
+	/// Byte array data of the log.
 	pub data: Vec<u8>,
 }
 
@@ -42,10 +41,6 @@ pub struct Vicinity {
 	/// Origin of the transaction.
 	pub origin: H160,
 }
-
-/// Gasometer config used for executor. Currently this is hard-coded to
-/// Istanbul hard fork.
-pub static GASOMETER_CONFIG: Config = Config::istanbul();
 
 /// Substrate backend for EVM.
 pub struct Backend<'vicinity, T> {
@@ -69,12 +64,12 @@ impl<'vicinity, T: Trait> BackendT for Backend<'vicinity, T> {
 			H256::default()
 		} else {
 			let number = T::BlockNumber::from(number.as_u32());
-			H256::from_slice(system::Module::<T>::block_hash(number).as_ref())
+			H256::from_slice(frame_system::Module::<T>::block_hash(number).as_ref())
 		}
 	}
 
 	fn block_number(&self) -> U256 {
-		let number: u128 = system::Module::<T>::block_number().unique_saturated_into();
+		let number: u128 = frame_system::Module::<T>::block_number().unique_saturated_into();
 		U256::from(number)
 	}
 
@@ -83,7 +78,7 @@ impl<'vicinity, T: Trait> BackendT for Backend<'vicinity, T> {
 	}
 
 	fn block_timestamp(&self) -> U256 {
-		let now: u128 = timestamp::Module::<T>::get().unique_saturated_into();
+		let now: u128 = pallet_timestamp::Module::<T>::get().unique_saturated_into();
 		U256::from(now)
 	}
 
@@ -96,7 +91,7 @@ impl<'vicinity, T: Trait> BackendT for Backend<'vicinity, T> {
 	}
 
 	fn chain_id(&self) -> U256 {
-		U256::from(runtime_io::misc::chain_id())
+		U256::from(sp_io::misc::chain_id())
 	}
 
 	fn exists(&self, _address: H160) -> bool {
@@ -177,7 +172,7 @@ impl<'vicinity, T: Trait> ApplyBackend for Backend<'vicinity, T> {
 		}
 
 		for log in logs {
-			Module::<T>::deposit_event(Event::Log(Log {
+			Module::<T>::deposit_event(Event::<T>::Log(Log {
 				address: log.address,
 				topics: log.topics,
 				data: log.data,

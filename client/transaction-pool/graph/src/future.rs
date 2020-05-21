@@ -1,34 +1,37 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::{
 	collections::{HashMap, HashSet},
 	fmt,
 	hash,
 	sync::Arc,
-	time,
 };
 
-use primitives::hexdisplay::HexDisplay;
-use sr_primitives::transaction_validity::{
+use sp_core::hexdisplay::HexDisplay;
+use sp_runtime::transaction_validity::{
 	TransactionTag as Tag,
 };
+use wasm_timer::Instant;
 
 use crate::base_pool::Transaction;
 
+#[cfg_attr(not(target_os = "unknown"), derive(parity_util_mem::MallocSizeOf))]
 /// Transaction with partially satisfied dependencies.
 pub struct WaitingTransaction<Hash, Ex> {
 	/// Transaction details.
@@ -36,7 +39,7 @@ pub struct WaitingTransaction<Hash, Ex> {
 	/// Tags that are required and have not been satisfied yet by other transactions in the pool.
 	pub missing_tags: HashSet<Tag>,
 	/// Time of import to the Future Queue.
-	pub imported_at: time::Instant,
+	pub imported_at: Instant,
 }
 
 impl<Hash: fmt::Debug, Ex: fmt::Debug> fmt::Debug for WaitingTransaction<Hash, Ex> {
@@ -90,7 +93,7 @@ impl<Hash, Ex> WaitingTransaction<Hash, Ex> {
 		WaitingTransaction {
 			transaction: Arc::new(transaction),
 			missing_tags,
-			imported_at: time::Instant::now(),
+			imported_at: Instant::now(),
 		}
 	}
 
@@ -110,6 +113,7 @@ impl<Hash, Ex> WaitingTransaction<Hash, Ex> {
 /// Contains transactions that are still awaiting for some other transactions that
 /// could provide a tag that they require.
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "unknown"), derive(parity_util_mem::MallocSizeOf))]
 pub struct FutureTransactions<Hash: hash::Hash + Eq, Ex> {
 	/// tags that are not yet provided by any transaction and we await for them
 	wanted_tags: HashMap<Tag, HashSet<Hash>>,
@@ -160,7 +164,7 @@ impl<Hash: hash::Hash + Eq + Clone, Ex> FutureTransactions<Hash, Ex> {
 	}
 
 	/// Returns a list of known transactions
-	pub fn by_hash(&self, hashes: &[Hash]) -> Vec<Option<Arc<Transaction<Hash, Ex>>>> {
+	pub fn by_hashes(&self, hashes: &[Hash]) -> Vec<Option<Arc<Transaction<Hash, Ex>>>> {
 		hashes.iter().map(|h| self.waiting.get(h).map(|x| x.transaction.clone())).collect()
 	}
 
@@ -227,6 +231,12 @@ impl<Hash: hash::Hash + Eq + Clone, Ex> FutureTransactions<Hash, Ex> {
 		self.waiting.values().map(|waiting| &*waiting.transaction)
 	}
 
+	/// Removes and returns all future transactions.
+	pub fn clear(&mut self) -> Vec<Arc<Transaction<Hash, Ex>>> {
+		self.wanted_tags.clear();
+		self.waiting.drain().map(|(_, tx)| tx.transaction).collect()
+	}
+
 	/// Returns number of transactions in the Future queue.
 	pub fn len(&self) -> usize {
 		self.waiting.len()
@@ -235,5 +245,34 @@ impl<Hash: hash::Hash + Eq + Clone, Ex> FutureTransactions<Hash, Ex> {
 	/// Returns sum of encoding lengths of all transactions in this queue.
 	pub fn bytes(&self) -> usize {
 		self.waiting.values().fold(0, |acc, tx| acc + tx.transaction.bytes)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use sp_runtime::transaction_validity::TransactionSource;
+
+	#[test]
+	fn can_track_heap_size() {
+		let mut future = FutureTransactions::default();
+		future.import(WaitingTransaction {
+			transaction: Transaction {
+				data: vec![0u8; 1024],
+				bytes: 1,
+				hash: 1,
+				priority: 1,
+				valid_till: 2,
+				requires: vec![vec![1], vec![2]],
+				provides: vec![vec![3], vec![4]],
+				propagate: true,
+				source: TransactionSource::External,
+			}.into(),
+			missing_tags: vec![vec![1u8], vec![2u8]].into_iter().collect(),
+			imported_at: std::time::Instant::now(),
+		});
+
+		// data is at least 1024!
+		assert!(parity_util_mem::malloc_size(&future) > 1024);
 	}
 }

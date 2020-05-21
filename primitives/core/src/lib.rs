@@ -1,18 +1,19 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Shareable Substrate types.
 
@@ -31,8 +32,8 @@ macro_rules! map {
 	);
 }
 
-use rstd::prelude::*;
-use rstd::ops::Deref;
+use sp_std::prelude::*;
+use sp_std::ops::Deref;
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 #[cfg(feature = "std")]
@@ -42,7 +43,7 @@ pub use serde;
 #[doc(hidden)]
 pub use codec::{Encode, Decode};
 
-pub use substrate_debug_derive::RuntimeDebug;
+pub use sp_debug_derive::RuntimeDebug;
 
 #[cfg(feature = "std")]
 pub use impl_serde::serialize as bytes;
@@ -61,6 +62,7 @@ pub mod ed25519;
 pub mod sr25519;
 pub mod ecdsa;
 pub mod hash;
+#[cfg(feature = "std")]
 mod hasher;
 pub mod offchain;
 pub mod sandbox;
@@ -69,25 +71,23 @@ mod changes_trie;
 #[cfg(feature = "std")]
 pub mod traits;
 pub mod testing;
-
-#[cfg(test)]
-mod tests;
+#[cfg(feature = "std")]
+pub mod tasks;
 
 pub use self::hash::{H160, H256, H512, convert_hash};
-pub use self::uint::U256;
-pub use changes_trie::ChangesTrieConfiguration;
+pub use self::uint::{U256, U512};
+pub use changes_trie::{ChangesTrieConfiguration, ChangesTrieConfigurationRange};
 #[cfg(feature = "full_crypto")]
 pub use crypto::{DeriveJunction, Pair, Public};
 
 pub use hash_db::Hasher;
-// Switch back to Blake after PoC-3 is out
-// pub use self::hasher::blake::BlakeHasher;
+#[cfg(feature = "std")]
 pub use self::hasher::blake2::Blake2Hasher;
 
-pub use primitives_storage as storage;
+pub use sp_storage as storage;
 
 #[doc(hidden)]
-pub use rstd;
+pub use sp_std;
 
 /// Context for executing a call into the runtime.
 pub enum ExecutionContext {
@@ -111,8 +111,11 @@ impl ExecutionContext {
 		match self {
 			Importing | Syncing | BlockConstruction =>
 				offchain::Capabilities::none(),
-			// Enable keystore by default for offchain calls. CC @bkchr
-			OffchainCall(None) => [offchain::Capability::Keystore][..].into(),
+			// Enable keystore and transaction pool by default for offchain calls.
+			OffchainCall(None) => [
+				offchain::Capability::Keystore,
+				offchain::Capability::TransactionPool,
+			][..].into(),
 			OffchainCall(Some((_, capabilities))) => *capabilities,
 		}
 	}
@@ -136,6 +139,15 @@ impl Deref for Bytes {
 	fn deref(&self) -> &[u8] { &self.0[..] }
 }
 
+#[cfg(feature = "std")]
+impl sp_std::str::FromStr for Bytes {
+	type Err = bytes::FromHexError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		bytes::from_hex(s).map(Bytes)
+	}
+}
+
 /// Stores the encoded `RuntimeMetadata` for the native side as opaque type.
 #[derive(Encode, Decode, PartialEq)]
 pub struct OpaqueMetadata(Vec<u8>);
@@ -147,7 +159,7 @@ impl OpaqueMetadata {
 	}
 }
 
-impl rstd::ops::Deref for OpaqueMetadata {
+impl sp_std::ops::Deref for OpaqueMetadata {
 	type Target = Vec<u8>;
 
 	fn deref(&self) -> &Self::Target {
@@ -165,8 +177,8 @@ pub enum NativeOrEncoded<R> {
 }
 
 #[cfg(feature = "std")]
-impl<R: codec::Encode> rstd::fmt::Debug for NativeOrEncoded<R> {
-	fn fmt(&self, f: &mut rstd::fmt::Formatter) -> rstd::fmt::Result {
+impl<R: codec::Encode> sp_std::fmt::Debug for NativeOrEncoded<R> {
+	fn fmt(&self, f: &mut sp_std::fmt::Formatter) -> sp_std::fmt::Result {
 		hexdisplay::HexDisplay::from(&self.as_encoded().as_ref()).fmt(f)
 	}
 }
@@ -204,7 +216,7 @@ impl<R: PartialEq + codec::Decode> PartialEq for NativeOrEncoded<R> {
 }
 
 /// A value that is never in a native representation.
-/// This is type is useful in conjuction with `NativeOrEncoded`.
+/// This is type is useful in conjunction with `NativeOrEncoded`.
 #[cfg(feature = "std")]
 #[derive(PartialEq)]
 pub enum NeverNativeValue {}
@@ -235,8 +247,8 @@ pub trait TypeId {
 
 /// A log level matching the one from `log` crate.
 ///
-/// Used internally by `runtime_io::log` method.
-#[derive(Encode, Decode, runtime_interface::pass_by::PassByEnum, Copy, Clone)]
+/// Used internally by `sp_io::log` method.
+#[derive(Encode, Decode, sp_runtime_interface::pass_by::PassByEnum, Copy, Clone)]
 pub enum LogLevel {
 	/// `Error` log level.
 	Error = 1,
@@ -305,7 +317,47 @@ pub fn to_substrate_wasm_fn_return_value(value: &impl Encode) -> u64 {
 	// Leak the output vector to avoid it being freed.
 	// This is fine in a WASM context since the heap
 	// will be discarded after the call.
-	rstd::mem::forget(encoded);
+	sp_std::mem::forget(encoded);
 
 	res
+}
+
+/// Macro for creating `Maybe*` marker traits.
+///
+/// Such a maybe-marker trait requires the given bound when `feature = std` and doesn't require
+/// the bound on `no_std`. This is useful for situations where you require that a type implements
+/// a certain trait with `feature = std`, but not on `no_std`.
+///
+/// # Example
+///
+/// ```
+/// sp_core::impl_maybe_marker! {
+///     /// A marker for a type that implements `Debug` when `feature = std`.
+///     trait MaybeDebug: std::fmt::Debug;
+///     /// A marker for a type that implements `Debug + Display` when `feature = std`.
+///     trait MaybeDebugDisplay: std::fmt::Debug, std::fmt::Display;
+/// }
+/// ```
+#[macro_export]
+macro_rules! impl_maybe_marker {
+	(
+		$(
+			$(#[$doc:meta] )+
+			trait $trait_name:ident: $( $trait_bound:path ),+;
+		)+
+	) => {
+		$(
+			$(#[$doc])+
+			#[cfg(feature = "std")]
+			pub trait $trait_name: $( $trait_bound + )+ {}
+			#[cfg(feature = "std")]
+			impl<T: $( $trait_bound + )+> $trait_name for T {}
+
+			$(#[$doc])+
+			#[cfg(not(feature = "std"))]
+			pub trait $trait_name {}
+			#[cfg(not(feature = "std"))]
+			impl<T> $trait_name for T {}
+		)+
+	}
 }

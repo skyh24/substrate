@@ -1,4 +1,4 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
+// Copyright 2019-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -20,27 +20,22 @@ use std::sync::Arc;
 use futures::{future::ready, FutureExt, TryFutureExt};
 use rpc::futures::future::{result, Future, Either};
 
-use api::Subscriptions;
-use client::{
-	self, Client,
-	light::{
-		fetcher::{Fetcher, RemoteBodyRequest},
-		blockchain::RemoteBlockchain,
-	},
-};
-use primitives::{H256, Blake2Hasher};
-use sr_primitives::{
+use sc_rpc_api::Subscriptions;
+use sc_client_api::light::{Fetcher, RemoteBodyRequest, RemoteBlockchain};
+use sp_runtime::{
 	generic::{BlockId, SignedBlock},
 	traits::{Block as BlockT},
 };
 
 use super::{ChainBackend, client_err, error::FutureResult};
+use sp_blockchain::HeaderBackend;
+use sc_client_api::BlockchainEvents;
 
 /// Blockchain API backend for light nodes. Reads all the data from local
 /// database, if available, or fetches it from remote node otherwise.
-pub struct LightChain<B, E, Block: BlockT, RA, F> {
+pub struct LightChain<Block: BlockT, Client, F> {
 	/// Substrate client.
-	client: Arc<Client<B, E, Block, RA>>,
+	client: Arc<Client>,
 	/// Current subscriptions.
 	subscriptions: Subscriptions,
 	/// Remote blockchain reference
@@ -49,10 +44,10 @@ pub struct LightChain<B, E, Block: BlockT, RA, F> {
 	fetcher: Arc<F>,
 }
 
-impl<B, E, Block: BlockT, RA, F: Fetcher<Block>> LightChain<B, E, Block, RA, F> {
+impl<Block: BlockT, Client, F: Fetcher<Block>> LightChain<Block, Client, F> {
 	/// Create new Chain API RPC handler.
 	pub fn new(
-		client: Arc<Client<B, E, Block, RA>>,
+		client: Arc<Client>,
 		subscriptions: Subscriptions,
 		remote_blockchain: Arc<dyn RemoteBlockchain<Block>>,
 		fetcher: Arc<F>,
@@ -66,14 +61,12 @@ impl<B, E, Block: BlockT, RA, F: Fetcher<Block>> LightChain<B, E, Block, RA, F> 
 	}
 }
 
-impl<B, E, Block, RA, F> ChainBackend<B, E, Block, RA> for LightChain<B, E, Block, RA, F> where
-	Block: BlockT<Hash=H256> + 'static,
-	B: client_api::backend::Backend<Block, Blake2Hasher> + Send + Sync + 'static,
-	E: client::CallExecutor<Block, Blake2Hasher> + Send + Sync + 'static,
-	RA: Send + Sync + 'static,
+impl<Block, Client, F> ChainBackend<Client, Block> for LightChain<Block, Client, F> where
+	Block: BlockT + 'static,
+	Client: BlockchainEvents<Block> + HeaderBackend<Block> + Send + Sync + 'static,
 	F: Fetcher<Block> + Send + Sync + 'static,
 {
-	fn client(&self) -> &Arc<Client<B, E, Block, RA>> {
+	fn client(&self) -> &Arc<Client> {
 		&self.client
 	}
 
@@ -85,7 +78,7 @@ impl<B, E, Block, RA, F> ChainBackend<B, E, Block, RA> for LightChain<B, E, Bloc
 		let hash = self.unwrap_or_best(hash);
 
 		let fetcher = self.fetcher.clone();
-		let maybe_header = client::light::blockchain::future_header(
+		let maybe_header = sc_client_api::light::future_header(
 			&*self.remote_blockchain,
 			&*fetcher,
 			BlockId::Hash(hash),

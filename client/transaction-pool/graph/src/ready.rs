@@ -1,18 +1,20 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::{
 	collections::{HashMap, HashSet, BTreeSet},
@@ -22,21 +24,21 @@ use std::{
 };
 
 use serde::Serialize;
-use log::debug;
+use log::trace;
 use parking_lot::RwLock;
-use sr_primitives::traits::Member;
-use sr_primitives::transaction_validity::{
+use sp_runtime::traits::Member;
+use sp_runtime::transaction_validity::{
 	TransactionTag as Tag,
 };
+use sp_transaction_pool::error;
 
-use crate::error;
 use crate::future::WaitingTransaction;
 use crate::base_pool::Transaction;
 
 /// An in-pool transaction reference.
 ///
 /// Should be cheap to clone.
-#[derive(Debug)]
+#[derive(Debug, parity_util_mem::MallocSizeOf)]
 pub struct TransactionRef<Hash, Ex> {
 	/// The actual transaction data.
 	pub transaction: Arc<Transaction<Hash, Ex>>,
@@ -56,8 +58,8 @@ impl<Hash, Ex> Clone for TransactionRef<Hash, Ex> {
 impl<Hash, Ex> Ord for TransactionRef<Hash, Ex> {
 	fn cmp(&self, other: &Self) -> cmp::Ordering {
 		self.transaction.priority.cmp(&other.transaction.priority)
-			.then(other.transaction.valid_till.cmp(&self.transaction.valid_till))
-			.then(other.insertion_id.cmp(&self.insertion_id))
+			.then_with(|| other.transaction.valid_till.cmp(&self.transaction.valid_till))
+			.then_with(|| other.insertion_id.cmp(&self.insertion_id))
 	}
 }
 
@@ -74,7 +76,7 @@ impl<Hash, Ex> PartialEq for TransactionRef<Hash, Ex> {
 }
 impl<Hash, Ex> Eq for TransactionRef<Hash, Ex> {}
 
-#[derive(Debug)]
+#[derive(Debug, parity_util_mem::MallocSizeOf)]
 pub struct ReadyTx<Hash, Ex> {
 	/// A reference to a transaction
 	pub transaction: TransactionRef<Hash, Ex>,
@@ -104,7 +106,7 @@ Hence every hash retrieved from `provided_tags` is always present in `ready`;
 qed
 "#;
 
-#[derive(Debug)]
+#[derive(Debug, parity_util_mem::MallocSizeOf)]
 pub struct ReadyTransactions<Hash: hash::Hash + Eq, Ex> {
 	/// Insertion id
 	insertion_id: u64,
@@ -161,7 +163,10 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 		&mut self,
 		tx: WaitingTransaction<Hash, Ex>,
 	) -> error::Result<Vec<Arc<Transaction<Hash, Ex>>>> {
-		assert!(tx.is_ready(), "Only ready transactions can be imported.");
+		assert!(
+			tx.is_ready(),
+			"Only ready transactions can be imported. Missing: {:?}", tx.missing_tags
+		);
 		assert!(!self.ready.read().contains_key(&tx.transaction.hash), "Transaction is already imported.");
 
 		self.insertion_id += 1;
@@ -169,10 +174,11 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 		let hash = tx.transaction.hash.clone();
 		let transaction = tx.transaction;
 
-		let replaced = self.replace_previous(&transaction)?;
+		let (replaced, unlocks) = self.replace_previous(&transaction)?;
 
 		let mut goes_to_best = true;
 		let mut ready = self.ready.write();
+		let mut requires_offset = 0;
 		// Add links to transactions that unlock the current one
 		for tag in &transaction.requires {
 			// Check if the transaction that satisfies the tag is still in the queue.
@@ -181,10 +187,14 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 				tx.unlocks.push(hash.clone());
 				// this transaction depends on some other, so it doesn't go to best directly.
 				goes_to_best = false;
+			} else {
+				requires_offset += 1;
 			}
 	 	}
 
 		// update provided_tags
+		// call to replace_previous guarantees that we will be overwriting
+		// only entries that have been removed.
 		for tag in &transaction.provides {
 			self.provided_tags.insert(tag.clone(), hash.clone());
 		}
@@ -202,8 +212,8 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 		// insert to Ready
 		ready.insert(hash, ReadyTx {
 			transaction,
-			unlocks: vec![],
-			requires_offset: 0,
+			unlocks,
+			requires_offset,
 		});
 
 		Ok(replaced)
@@ -222,23 +232,40 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 		self.ready.read().contains_key(hash)
 	}
 
-	/// Retrieve transaction by hash
-	pub fn by_hash(&self, hashes: &[Hash]) -> Vec<Option<Arc<Transaction<Hash, Ex>>>> {
+	/// Retrive transaction by hash
+	pub fn by_hash(&self, hash: &Hash) -> Option<Arc<Transaction<Hash, Ex>>> {
+		self.by_hashes(&[hash.clone()]).into_iter().next().unwrap_or(None)
+	}
+
+	/// Retrieve transactions by hash
+	pub fn by_hashes(&self, hashes: &[Hash]) -> Vec<Option<Arc<Transaction<Hash, Ex>>>> {
 		let ready = self.ready.read();
 		hashes.iter().map(|hash| {
 			ready.get(hash).map(|x| x.transaction.transaction.clone())
 		}).collect()
 	}
 
-	/// Removes invalid transactions from the ready pool.
+	/// Removes a subtree of transactions from the ready pool.
 	///
 	/// NOTE removing a transaction will also cause a removal of all transactions that depend on that one
 	/// (i.e. the entire subgraph that this transaction is a start of will be removed).
 	/// All removed transactions are returned.
-	pub fn remove_invalid(&mut self, hashes: &[Hash]) -> Vec<Arc<Transaction<Hash, Ex>>> {
-		let mut removed = vec![];
-		let mut to_remove = hashes.iter().cloned().collect::<Vec<_>>();
+	pub fn remove_subtree(&mut self, hashes: &[Hash]) -> Vec<Arc<Transaction<Hash, Ex>>> {
+		let to_remove = hashes.iter().cloned().collect::<Vec<_>>();
+		self.remove_subtree_with_tag_filter(to_remove, None)
+	}
 
+	/// Removes a subtrees of transactions trees starting from roots given in `to_remove`.
+	///
+	/// We proceed with a particular branch only if there is at least one provided tag
+	/// that is not part of `provides_tag_filter`. I.e. the filter contains tags
+	/// that will stay in the pool, so that we can early exit and avoid descending.
+	fn remove_subtree_with_tag_filter(
+		&mut self,
+		mut to_remove: Vec<Hash>,
+		provides_tag_filter: Option<HashSet<Tag>>,
+	) -> Vec<Arc<Transaction<Hash, Ex>>> {
+		let mut removed = vec![];
 		let mut ready = self.ready.write();
 		loop {
 			let hash = match to_remove.pop() {
@@ -247,10 +274,21 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 			};
 
 			if let Some(mut tx) = ready.remove(&hash) {
+				let invalidated = tx.transaction.transaction.provides
+					.iter()
+					.filter(|tag| provides_tag_filter
+						.as_ref()
+						.map(|filter| !filter.contains(&**tag))
+						.unwrap_or(true)
+					);
+
+				let mut removed_some_tags = false;
 				// remove entries from provided_tags
-				for tag in &tx.transaction.transaction.provides {
+				for tag in invalidated {
+					removed_some_tags = true;
 					self.provided_tags.remove(tag);
 				}
+
 				// remove from unlocks
 				for tag in &tx.transaction.transaction.requires {
 					if let Some(hash) = self.provided_tags.get(tag) {
@@ -263,11 +301,13 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 				// remove from best
 				self.best.remove(&tx.transaction);
 
-				// remove all transactions that the current one unlocks
-				to_remove.append(&mut tx.unlocks);
+				if removed_some_tags {
+					// remove all transactions that the current one unlocks
+					to_remove.append(&mut tx.unlocks);
+				}
 
 				// add to removed
-				debug!(target: "txpool", "[{:?}] Removed as invalid: ", hash);
+				trace!(target: "txpool", "[{:?}] Removed as part of the subtree.", hash);
 				removed.push(tx.transaction.transaction);
 			}
 		}
@@ -363,9 +403,15 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 	/// we are about to replace is lower than the priority of the replacement transaction.
 	/// We remove/replace old transactions in case they have lower priority.
 	///
-	/// In case replacement is successful returns a list of removed transactions.
-	fn replace_previous(&mut self, tx: &Transaction<Hash, Ex>) -> error::Result<Vec<Arc<Transaction<Hash, Ex>>>> {
-		let mut to_remove = {
+	/// In case replacement is successful returns a list of removed transactions
+	/// and a list of hashes that are still in pool and gets unlocked by the new transaction.
+	fn replace_previous(
+		&mut self,
+		tx: &Transaction<Hash, Ex>,
+	) -> error::Result<
+		(Vec<Arc<Transaction<Hash, Ex>>>, Vec<Hash>)
+	> {
+		let (to_remove, unlocks) = {
 			// check if we are replacing a transaction
 			let replace_hashes = tx.provides
 				.iter()
@@ -374,7 +420,7 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 
 			// early exit if we are not replacing anything.
 			if replace_hashes.is_empty() {
-				return Ok(vec![]);
+				return Ok((vec![], vec![]));
 			}
 
 			// now check if collective priority is lower than the replacement transaction.
@@ -383,7 +429,9 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 				replace_hashes
 					.iter()
 					.filter_map(|hash| ready.get(hash))
-					.fold(0u64, |total, tx| total.saturating_add(tx.transaction.transaction.priority))
+					.fold(0u64, |total, tx|
+						total.saturating_add(tx.transaction.transaction.priority)
+					)
 			};
 
 			// bail - the transaction has too low priority to replace the old ones
@@ -391,35 +439,31 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 				return Err(error::Error::TooLowPriority { old: old_priority, new: tx.priority })
 			}
 
-			replace_hashes.into_iter().cloned().collect::<Vec<_>>()
+			// construct a list of unlocked transactions
+			let unlocks = {
+				let ready = self.ready.read();
+				replace_hashes
+					.iter()
+					.filter_map(|hash| ready.get(hash))
+					.fold(vec![], |mut list, tx| {
+						list.extend(tx.unlocks.iter().cloned());
+						list
+					})
+			};
+
+			(
+				replace_hashes.into_iter().cloned().collect::<Vec<_>>(),
+				unlocks
+			)
 		};
 
 		let new_provides = tx.provides.iter().cloned().collect::<HashSet<_>>();
-		let mut removed = vec![];
-		loop {
-			let hash = match to_remove.pop() {
-				Some(hash) => hash,
-				None => return Ok(removed),
-			};
+		let removed = self.remove_subtree_with_tag_filter(to_remove, Some(new_provides));
 
-			let tx = self.ready.write().remove(&hash).expect(HASH_READY);
-			// check if this transaction provides stuff that is not provided by the new one.
-			let (mut unlocks, tx) = (tx.unlocks, tx.transaction.transaction);
-			{
-				let invalidated = tx.provides
-					.iter()
-					.filter(|tag| !new_provides.contains(&**tag));
-
-				for tag in invalidated {
-					// remove the tag since it's no longer provided by any transaction
-					self.provided_tags.remove(tag);
-					// add more transactions to remove
-					to_remove.append(&mut unlocks);
-				}
-			}
-
-			removed.push(tx);
-		}
+		Ok((
+			removed,
+			unlocks
+		))
 	}
 
 	/// Returns number of transactions in this queue.
@@ -433,6 +477,7 @@ impl<Hash: hash::Hash + Member + Serialize, Ex> ReadyTransactions<Hash, Ex> {
 	}
 }
 
+/// Iterator of ready transactions ordered by priority.
 pub struct BestIterator<Hash, Ex> {
 	all: Arc<RwLock<HashMap<Hash, ReadyTx<Hash, Ex>>>>,
 	awaiting: HashMap<Hash, (usize, TransactionRef<Hash, Ex>)>,
@@ -443,7 +488,7 @@ impl<Hash: hash::Hash + Member, Ex> BestIterator<Hash, Ex> {
 	/// Depending on number of satisfied requirements insert given ref
 	/// either to awaiting set or to best set.
 	fn best_or_awaiting(&mut self, satisfied: usize, tx_ref: TransactionRef<Hash, Ex>) {
-		if satisfied == tx_ref.transaction.requires.len() {
+		if satisfied >= tx_ref.transaction.requires.len() {
 			// If we have satisfied all deps insert to best
 			self.best.insert(tx_ref);
 
@@ -502,6 +547,7 @@ fn remove_item<T: PartialEq>(vec: &mut Vec<T>, item: &T) {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use sp_runtime::transaction_validity::TransactionSource as Source;
 
 	fn tx(id: u8) -> Transaction<u64, Vec<u8>> {
 		Transaction {
@@ -513,7 +559,16 @@ mod tests {
 			requires: vec![vec![1], vec![2]],
 			provides: vec![vec![3], vec![4]],
 			propagate: true,
+			source: Source::External,
 		}
+	}
+
+	fn import<H: hash::Hash + Eq + Member + Serialize, Ex>(
+		ready: &mut ReadyTransactions<H, Ex>,
+		tx: Transaction<H, Ex>
+	) -> error::Result<Vec<Arc<Transaction<H, Ex>>>> {
+		let x = WaitingTransaction::new(tx, ready.provided_tags(), &[]);
+		ready.import(x)
 	}
 
 	#[test]
@@ -530,24 +585,56 @@ mod tests {
 		tx3.provides = vec![vec![4]];
 
 		// when
-		let x = WaitingTransaction::new(tx2, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
-		let x = WaitingTransaction::new(tx3, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
+		import(&mut ready, tx2).unwrap();
+		import(&mut ready, tx3).unwrap();
 		assert_eq!(ready.get().count(), 2);
 
 		// too low priority
-		let x = WaitingTransaction::new(tx1.clone(), &ready.provided_tags(), &[]);
-		ready.import(x).unwrap_err();
+		import(&mut ready, tx1.clone()).unwrap_err();
 
 		tx1.priority = 10;
-		let x = WaitingTransaction::new(tx1.clone(), &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
+		import(&mut ready, tx1).unwrap();
 
 		// then
 		assert_eq!(ready.get().count(), 1);
 	}
 
+	#[test]
+	fn should_replace_multiple_transactions_correctly() {
+		// given
+		let mut ready = ReadyTransactions::default();
+		let mut tx0 = tx(0);
+		tx0.requires = vec![];
+		tx0.provides = vec![vec![0]];
+		let mut tx1 = tx(1);
+		tx1.requires = vec![];
+		tx1.provides = vec![vec![1]];
+		let mut tx2 = tx(2);
+		tx2.requires = vec![vec![0], vec![1]];
+		tx2.provides = vec![vec![2], vec![3]];
+		let mut tx3 = tx(3);
+		tx3.requires = vec![vec![2]];
+		tx3.provides = vec![vec![4]];
+		let mut tx4 = tx(4);
+		tx4.requires = vec![vec![3]];
+		tx4.provides = vec![vec![5]];
+		// replacement
+		let mut tx2_2 = tx(5);
+		tx2_2.requires = vec![vec![0], vec![1]];
+		tx2_2.provides = vec![vec![2]];
+		tx2_2.priority = 10;
+
+		for tx in vec![tx0, tx1, tx2, tx3, tx4] {
+			import(&mut ready, tx).unwrap();
+		}
+		assert_eq!(ready.get().count(), 5);
+
+		// when
+		import(&mut ready, tx2_2).unwrap();
+
+		// then
+		assert_eq!(ready.get().count(), 3);
+	}
 
 	#[test]
 	fn should_return_best_transactions_in_correct_order() {
@@ -573,19 +660,13 @@ mod tests {
 			requires: vec![tx1.provides[0].clone()],
 			provides: vec![],
 			propagate: true,
+			source: Source::External,
 		};
 
 		// when
-		let x = WaitingTransaction::new(tx1, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
-		let x = WaitingTransaction::new(tx2, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
-		let x = WaitingTransaction::new(tx3, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
-		let x = WaitingTransaction::new(tx4, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
-		let x = WaitingTransaction::new(tx5, &ready.provided_tags(), &[]);
-		ready.import(x).unwrap();
+		for tx in vec![tx1, tx2, tx3, tx4, tx5] {
+			import(&mut ready, tx).unwrap();
+		}
 
 		// then
 		assert_eq!(ready.best.len(), 1);
@@ -598,6 +679,25 @@ mod tests {
 		assert_eq!(it.next(), Some(4));
 		assert_eq!(it.next(), Some(5));
 		assert_eq!(it.next(), None);
+	}
+
+	#[test]
+	fn can_report_heap_size() {
+		let mut ready = ReadyTransactions::default();
+		let tx = Transaction {
+			data: vec![5],
+			bytes: 1,
+			hash: 5,
+			priority: 1,
+			valid_till: u64::max_value(),	// use the max_value() here for testing.
+			requires: vec![],
+			provides: vec![],
+			propagate: true,
+			source: Source::External,
+		};
+		import(&mut ready, tx).unwrap();
+
+		assert!(parity_util_mem::malloc_size(&ready) > 200);
 	}
 
 	#[test]

@@ -1,27 +1,36 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Types and traits for interfacing between the host and the wasm runtime.
 
-use std::{borrow::Cow, marker::PhantomData, mem, iter::Iterator, result};
+#![cfg_attr(not(feature = "std"), no_std)]
 
+use sp_std::{
+	borrow::Cow, marker::PhantomData, mem, iter::Iterator, result, vec::Vec,
+};
+
+#[cfg(feature = "std")]
 mod wasmi_impl;
 
 /// Result type used by traits in this crate.
+#[cfg(feature = "std")]
 pub type Result<T> = result::Result<T, String>;
+#[cfg(not(feature = "std"))]
+pub type Result<T> = result::Result<T, &'static str>;
 
 /// Value types supported by Substrate on the boundary between host/Wasm.
 #[derive(Copy, Clone, PartialEq, Debug, Eq)]
@@ -36,16 +45,45 @@ pub enum ValueType {
 	F64,
 }
 
+impl From<ValueType> for u8 {
+	fn from(val: ValueType) -> u8 {
+		match val {
+			ValueType::I32 => 0,
+			ValueType::I64 => 1,
+			ValueType::F32 => 2,
+			ValueType::F64 => 3,
+		}
+	}
+}
+
+impl sp_std::convert::TryFrom<u8> for ValueType {
+	type Error = ();
+
+	fn try_from(val: u8) -> sp_std::result::Result<ValueType, ()> {
+		match val {
+			0 => Ok(Self::I32),
+			1 => Ok(Self::I64),
+			2 => Ok(Self::F32),
+			3 => Ok(Self::F64),
+			_ => Err(()),
+		}
+	}
+}
+
 /// Values supported by Substrate on the boundary between host/Wasm.
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Debug, Clone, Copy, codec::Encode, codec::Decode)]
 pub enum Value {
-	/// An `i32` value.
+	/// A 32-bit integer.
 	I32(i32),
-	/// An `i64` value.
+	/// A 64-bit integer.
 	I64(i64),
-	/// An nan-preserving `f32` value.
+	/// A 32-bit floating-point number stored as raw bit pattern.
+	///
+	/// You can materialize this value using `f32::from_bits`.
 	F32(u32),
-	/// An nan-preserving `f64` value.
+	/// A 64-bit floating-point number stored as raw bit pattern.
+	///
+	/// You can materialize this value using `f64::from_bits`.
 	F64(u64),
 }
 
@@ -57,6 +95,14 @@ impl Value {
 			Value::I64(_) => ValueType::I64,
 			Value::F32(_) => ValueType::F32,
 			Value::F64(_) => ValueType::F64,
+		}
+	}
+
+	/// Return `Self` as `i32`.
+	pub fn as_i32(&self) -> Option<i32> {
+		match self {
+			Self::I32(val) => Some(*val),
+			_ => None,
 		}
 	}
 }
@@ -74,7 +120,7 @@ mod private {
 /// Something that can be wrapped in a wasm `Pointer`.
 ///
 /// This trait is sealed.
-pub trait PointerType: Sized {
+pub trait PointerType: Sized + private::Sealed {
 	/// The size of the type in wasm.
 	const SIZE: u32 = mem::size_of::<Self>() as u32;
 }
@@ -122,6 +168,12 @@ impl<T: PointerType> Pointer<T> {
 	/// Cast this pointer of type `T` to a pointer of type `R`.
 	pub fn cast<R: PointerType>(self) -> Pointer<R> {
 		Pointer::new(self.ptr)
+	}
+}
+
+impl<T: PointerType> From<u32> for Pointer<T> {
+	fn from(ptr: u32) -> Self {
+		Pointer::new(ptr)
 	}
 }
 
@@ -185,11 +237,22 @@ impl Signature {
 			return_value: None,
 		}
 	}
-
 }
 
+/// A trait that requires `RefUnwindSafe` when `feature = std`.
+#[cfg(feature = "std")]
+pub trait MaybeRefUnwindSafe: std::panic::RefUnwindSafe {}
+#[cfg(feature = "std")]
+impl<T: std::panic::RefUnwindSafe> MaybeRefUnwindSafe for T {}
+
+/// A trait that requires `RefUnwindSafe` when `feature = std`.
+#[cfg(not(feature = "std"))]
+pub trait MaybeRefUnwindSafe {}
+#[cfg(not(feature = "std"))]
+impl<T> MaybeRefUnwindSafe for T {}
+
 /// Something that provides a function implementation on the host for a wasm function.
-pub trait Function: std::panic::RefUnwindSafe + Send + Sync {
+pub trait Function: MaybeRefUnwindSafe + Send + Sync {
 	/// Returns the name of this function.
 	fn name(&self) -> &str;
 	/// Returns the signature of this function.
@@ -275,6 +338,12 @@ pub trait Sandbox {
 		raw_env_def: &[u8],
 		state: u32,
 	) -> Result<u32>;
+
+	/// Get the value from a global with the given `name`. The sandbox is determined by the
+	/// given `instance_idx` instance.
+	///
+	/// Returns `Some(_)` when the requested global variable could be found.
+	fn get_global_val(&self, instance_idx: u32, name: &str) -> Result<Option<Value>>;
 }
 
 /// Something that provides implementations for host functions.
@@ -386,9 +455,37 @@ impl ReadPrimitive<u64> for &mut dyn FunctionContext {
 	}
 }
 
+/// Typed value that can be returned from a function.
+///
+/// Basically a `TypedValue` plus `Unit`, for functions which return nothing.
+#[derive(Clone, Copy, PartialEq, codec::Encode, codec::Decode, Debug)]
+pub enum ReturnValue {
+	/// For returning nothing.
+	Unit,
+	/// For returning some concrete value.
+	Value(Value),
+}
+
+impl From<Value> for ReturnValue {
+	fn from(v: Value) -> ReturnValue {
+		ReturnValue::Value(v)
+	}
+}
+
+impl ReturnValue {
+	/// Maximum number of bytes `ReturnValue` might occupy when serialized with `SCALE`.
+	///
+	/// Breakdown:
+	///  1 byte for encoding unit/value variant
+	///  1 byte for encoding value type
+	///  8 bytes for encoding the biggest value types available in wasm: f64, i64.
+	pub const ENCODED_MAX_SIZE: usize = 10;
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use codec::Encode;
 
 	#[test]
 	fn pointer_offset_works() {
@@ -401,5 +498,12 @@ mod tests {
 
 		assert_eq!(ptr.offset(10).unwrap(), Pointer::new(80));
 		assert_eq!(ptr.offset(32).unwrap(), Pointer::new(256));
+	}
+
+
+	#[test]
+	fn return_value_encoded_max_size() {
+		let encoded = ReturnValue::Value(Value::I64(-1)).encode();
+		assert_eq!(encoded.len(), ReturnValue::ENCODED_MAX_SIZE);
 	}
 }

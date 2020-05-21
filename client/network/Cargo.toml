@@ -1,65 +1,84 @@
 [package]
 description = "Substrate network protocol"
-name = "substrate-network"
-version = "2.0.0"
-license = "GPL-3.0"
+name = "sc-network"
+version = "0.8.0-dev"
+license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2018"
+homepage = "https://substrate.dev"
+repository = "https://github.com/paritytech/substrate/"
+documentation = "https://docs.rs/sc-network"
+
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+
+[build-dependencies]
+prost-build = "0.6.1"
 
 [dependencies]
-bytes = "0.4.12"
+bitflags = "1.2.0"
+bs58 = "0.3.1"
+bytes = "0.5.0"
+codec = { package = "parity-scale-codec", version = "1.3.0", features = ["derive"] }
 derive_more = "0.99.2"
 either = "1.5.3"
-log = "0.4.8"
-parking_lot = "0.9.0"
-bitflags = "1.2.0"
+erased-serde = "0.3.9"
 fnv = "1.0.6"
-futures = "0.1.29"
-futures03 = { package = "futures", version = "0.3.1", features = ["compat"] }
-futures-timer = "0.4.0"
+fork-tree = { version = "2.0.0-dev", path = "../../utils/fork-tree" }
+futures = "0.3.4"
+futures-timer = "3.0.1"
+futures_codec = "0.3.3"
+hex = "0.4.0"
+ip_network = "0.3.4"
 linked-hash-map = "0.5.2"
 linked_hash_set = "0.1.3"
+log = "0.4.8"
 lru = "0.4.0"
-rustc-hex = "2.0.1"
+nohash-hasher = "0.2.0"
+parking_lot = "0.10.0"
+pin-project = "0.4.6"
+prometheus-endpoint = { package = "substrate-prometheus-endpoint", version = "0.8.0-dev", path = "../../utils/prometheus" }
+prost = "0.6.1"
 rand = "0.7.2"
-libp2p = { version = "0.13.0", default-features = false, features = ["libp2p-websocket"] }
-fork-tree = { path = "../../utils/fork-tree" }
-consensus = { package = "substrate-consensus-common", path = "../../primitives/consensus/common" }
-client = { package = "substrate-client", path = "../" }
-client-api = { package = "substrate-client-api", path = "../api" }
-sp-blockchain = { path = "../../primitives/blockchain" }
-sr-primitives = { path = "../../primitives/sr-primitives" }
-sr-arithmetic = { path = "../../primitives/sr-arithmetic" }
-primitives = { package = "substrate-primitives", path = "../../primitives/core" }
-block-builder = { package = "substrate-block-builder", path = "../block-builder" }
-codec = { package = "parity-scale-codec", version = "1.0.0", features = ["derive"] }
-peerset = { package = "substrate-peerset", path = "../peerset" }
+sc-block-builder = { version = "0.8.0-dev", path = "../block-builder" }
+sc-client-api = { version = "2.0.0-dev", path = "../api" }
+sc-peerset = { version = "2.0.0-dev", path = "../peerset" }
 serde = { version = "1.0.101", features = ["derive"] }
 serde_json = "1.0.41"
 slog = { version = "2.5.2", features = ["nested-values"] }
 slog_derive = "0.2.0"
 smallvec = "0.6.10"
-tokio-io = "0.1.12"
-tokio = { version = "0.1.22", optional = true }
-unsigned-varint = { version = "0.2.2", features = ["codec"] }
-keyring = { package = "substrate-keyring", path = "../../primitives/keyring", optional = true }
-test_client = { package = "substrate-test-client", path = "../../test/utils/client", optional = true }
-test-client = { package = "substrate-test-runtime-client", path = "../../test/utils/runtime/client", optional = true }
-erased-serde = "0.3.9"
+sp-arithmetic = { version = "2.0.0-dev", path = "../../primitives/arithmetic" }
+sp-blockchain = { version = "2.0.0-dev", path = "../../primitives/blockchain" }
+sp-consensus = { version = "0.8.0-dev", path = "../../primitives/consensus/common" }
+sp-core = { version = "2.0.0-dev", path = "../../primitives/core" }
+sp-runtime = { version = "2.0.0-dev", path = "../../primitives/runtime" }
+sp-utils = { version = "2.0.0-dev", path = "../../primitives/utils" }
+thiserror = "1"
+unsigned-varint = { version = "0.3.1", features = ["futures", "futures-codec"] }
 void = "1.0.2"
+wasm-timer = "0.2"
 zeroize = "1.0.0"
-babe-primitives = { package = "substrate-consensus-babe-primitives", path = "../../primitives/consensus/babe" }
+
+[dependencies.libp2p]
+version = "0.19.0"
+default-features = false
+features = ["websocket", "kad", "mdns", "ping", "identify", "mplex", "yamux", "noise", "tcp-async-std"]
 
 [dev-dependencies]
+async-std = "1.5"
+assert_matches = "1.3"
 env_logger = "0.7.0"
-keyring = { package = "substrate-keyring", path = "../../primitives/keyring" }
+libp2p = { version = "0.19.0", default-features = false, features = ["secio"] }
 quickcheck = "0.9.0"
 rand = "0.7.2"
-test-client = { package = "substrate-test-runtime-client", path = "../../test/utils/runtime/client" }
-test_runtime = { package = "substrate-test-runtime", path = "../../test/utils/runtime" }
-tempdir = "0.3.7"
-tokio = "0.1.22"
+sp-keyring = { version = "2.0.0-dev", path = "../../primitives/keyring" }
+sp-test-primitives = { version = "2.0.0-dev", path = "../../primitives/test-primitives" }
+substrate-test-runtime = { version = "2.0.0-dev", path = "../../test-utils/runtime" }
+substrate-test-runtime-client = { version = "2.0.0-dev", path = "../../test-utils/runtime/client" }
+tempfile = "3.1.0"
 
 [features]
 default = []
-test-helpers = ["keyring", "test-client", "tokio"]

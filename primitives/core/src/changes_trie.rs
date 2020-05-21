@@ -1,18 +1,19 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2018-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Substrate changes trie configuration.
 
@@ -22,7 +23,7 @@ use codec::{Encode, Decode};
 use num_traits::Zero;
 
 /// Substrate changes trie configuration.
-#[cfg_attr(any(feature = "std", test), derive(Serialize, Deserialize))]
+#[cfg_attr(any(feature = "std", test), derive(Serialize, Deserialize, parity_util_mem::MallocSizeOf))]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Encode, Decode)]
 pub struct ChangesTrieConfiguration {
 	/// Interval (in blocks) at which level1-digests are created. Digests are not
@@ -36,6 +37,17 @@ pub struct ChangesTrieConfiguration {
 	/// && maximal digests interval will be truncated to the last interval that fits
 	/// `u32` limits.
 	pub digest_levels: u32,
+}
+
+/// Substrate changes trie configuration range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesTrieConfigurationRange<Number, Hash> {
+	/// Zero block of configuration.
+	pub zero: (Number, Hash),
+	/// Last block of configuration (if configuration has been deactivated at some point).
+	pub end: Option<(Number, Hash)>,
+	/// The configuration itself. None if changes tries were disabled in this range.
+	pub config: Option<ChangesTrieConfiguration>,
 }
 
 impl ChangesTrieConfiguration {
@@ -57,8 +69,8 @@ impl ChangesTrieConfiguration {
 	) -> bool
 		where
 			Number: From<u32> + PartialEq +
-			::rstd::ops::Rem<Output=Number> + ::rstd::ops::Sub<Output=Number> +
-			::rstd::cmp::PartialOrd + Zero,
+			::sp_std::ops::Rem<Output=Number> + ::sp_std::ops::Sub<Output=Number> +
+			::sp_std::cmp::PartialOrd + Zero,
 	{
 		block > zero
 			&& self.is_digest_build_enabled()
@@ -92,8 +104,8 @@ impl ChangesTrieConfiguration {
 	) -> Option<Number>
 		where
 			Number: Clone + From<u32> + PartialOrd + PartialEq +
-			::rstd::ops::Add<Output=Number> + ::rstd::ops::Sub<Output=Number> +
-			::rstd::ops::Div<Output=Number> + ::rstd::ops::Mul<Output=Number> + Zero,
+			::sp_std::ops::Add<Output=Number> + ::sp_std::ops::Sub<Output=Number> +
+			::sp_std::ops::Div<Output=Number> + ::sp_std::ops::Mul<Output=Number> + Zero,
 	{
 		if block <= zero {
 			return None;
@@ -126,8 +138,8 @@ impl ChangesTrieConfiguration {
 	) -> Option<(Number, Number)>
 		where
 			Number: Clone + From<u32> + PartialOrd + PartialEq +
-			::rstd::ops::Add<Output=Number> + ::rstd::ops::Sub<Output=Number> +
-			::rstd::ops::Div<Output=Number> + ::rstd::ops::Mul<Output=Number>,
+			::sp_std::ops::Add<Output=Number> + ::sp_std::ops::Sub<Output=Number> +
+			::sp_std::ops::Div<Output=Number> + ::sp_std::ops::Mul<Output=Number>,
 	{
 		if !self.is_digest_build_enabled() {
 			return None;
@@ -160,8 +172,8 @@ impl ChangesTrieConfiguration {
 	pub fn digest_level_at_block<Number>(&self, zero: Number, block: Number) -> Option<(u32, u32, u32)>
 		where
 			Number: Clone + From<u32> + PartialEq +
-			::rstd::ops::Rem<Output=Number> + ::rstd::ops::Sub<Output=Number> +
-			::rstd::cmp::PartialOrd + Zero,
+			::sp_std::ops::Rem<Output=Number> + ::sp_std::ops::Sub<Output=Number> +
+			::sp_std::cmp::PartialOrd + Zero,
 	{
 		if !self.is_digest_build_required_at_block(zero.clone(), block.clone()) {
 			return None;

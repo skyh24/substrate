@@ -1,18 +1,19 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use frame_support_procedural_tools::syn_ext as ext;
 use proc_macro2::Span;
@@ -27,6 +28,14 @@ mod keyword {
 	syn::custom_keyword!(Block);
 	syn::custom_keyword!(NodeBlock);
 	syn::custom_keyword!(UncheckedExtrinsic);
+	syn::custom_keyword!(Module);
+	syn::custom_keyword!(Call);
+	syn::custom_keyword!(Storage);
+	syn::custom_keyword!(Event);
+	syn::custom_keyword!(Config);
+	syn::custom_keyword!(Origin);
+	syn::custom_keyword!(Inherent);
+	syn::custom_keyword!(ValidateUnsigned);
 }
 
 #[derive(Debug)]
@@ -83,7 +92,7 @@ impl Parse for WhereSection {
 		}) = definitions.first()
 		{
 			let msg = format!(
-				"`{:?}` was declared above. Please use exactly one delcataion for `{:?}`.",
+				"`{:?}` was declared above. Please use exactly one declaration for `{:?}`.",
 				kind, kind
 			);
 			return Err(Error::new(*kind_span, msg));
@@ -145,7 +154,7 @@ pub struct ModuleDeclaration {
 	pub name: Ident,
 	pub module: Ident,
 	pub instance: Option<Ident>,
-	pub details: Option<ext::Braces<ext::Punctuated<ModuleEntry, Token![,]>>>,
+	pub module_parts: Vec<ModulePart>,
 }
 
 impl Parse for ModuleDeclaration {
@@ -162,150 +171,183 @@ impl Parse for ModuleDeclaration {
 		} else {
 			None
 		};
-		let details = if input.peek(Token![::]) {
-			let _: Token![::] = input.parse()?;
-			Some(input.parse()?)
-		} else {
-			None
-		};
+
+		let _: Token![::] = input.parse()?;
+		let module_parts = parse_module_parts(input)?;
+
 		let parsed = Self {
 			name,
 			module,
 			instance,
-			details,
+			module_parts,
 		};
-		if let Some(ref details) = parsed.details {
-			let parts = &details.content.inner;
-			let mut resolved = HashSet::new();
-			let has_default = parts.into_iter().any(|m| m.is_default());
-			for entry in parts {
-				match entry {
-					ModuleEntry::Part(part) if has_default => {
-						if part.is_included_in_default() {
-							let msg = format!(
-									"`{}` is already included in `default`. Either remove `default` or remove `{}`",
-									part.name,
-									part.name
-								);
-							return Err(Error::new(part.name.span(), msg));
-						}
-					}
-					ModuleEntry::Part(part) => {
-						if !resolved.insert(part.name.clone()) {
-							let msg = format!(
-								"`{}` was already declared before. Please remove the duplicate declaration",
-								part.name
-							);
-							return Err(Error::new(part.name.span(), msg));
-						}
-					}
-					_ => {}
-				}
-			}
-		}
+
 		Ok(parsed)
 	}
 }
 
 impl ModuleDeclaration {
-	/// Get resolved module parts, i.e. after expanding `default` keyword
-	/// or empty declaration
-	pub fn module_parts(&self) -> Vec<ModulePart> {
-		if let Some(ref details) = self.details {
-			details
-				.content
-				.inner
-				.iter()
-				.flat_map(|entry| match entry {
-					ModuleEntry::Default(ref token) => Self::default_modules(token.span()),
-					ModuleEntry::Part(ref part) => vec![part.clone()],
-				})
-				.collect()
-		} else {
-			Self::default_modules(self.module.span())
-		}
+	/// Get resolved module parts
+	pub fn module_parts(&self) -> &[ModulePart] {
+		&self.module_parts
 	}
 
-	pub fn find_part(&self, name: &str) -> Option<ModulePart> {
-		self.module_parts()
-			.into_iter()
-			.find(|part| part.name == name)
+	pub fn find_part(&self, name: &str) -> Option<&ModulePart> {
+		self.module_parts.iter().find(|part| part.name() == name)
 	}
 
 	pub fn exists_part(&self, name: &str) -> bool {
 		self.find_part(name).is_some()
 	}
+}
 
-	fn default_modules(span: Span) -> Vec<ModulePart> {
-		let mut res: Vec<_> = ["Module", "Call", "Storage"]
-			.into_iter()
-			.map(|name| ModulePart::with_name(name, span))
-			.collect();
-		res.extend(
-			["Event", "Config"]
-				.into_iter()
-				.map(|name| ModulePart::with_generics(name, span)),
-		);
-		res
+/// Parse [`ModulePart`]'s from a braces enclosed list that is split by commas, e.g.
+///
+/// `{ Call, Event }`
+fn parse_module_parts(input: ParseStream) -> Result<Vec<ModulePart>> {
+	let module_parts :ext::Braces<ext::Punctuated<ModulePart, Token![,]>> = input.parse()?;
+
+	let mut resolved = HashSet::new();
+	for part in module_parts.content.inner.iter() {
+		if !resolved.insert(part.name()) {
+			let msg = format!(
+				"`{}` was already declared before. Please remove the duplicate declaration",
+				part.name(),
+			);
+			return Err(Error::new(part.keyword.span(), msg));
+		}
 	}
+
+	Ok(module_parts.content.inner.into_iter().collect())
 }
 
-#[derive(Debug)]
-pub enum ModuleEntry {
-	Default(Token![default]),
-	Part(ModulePart),
+#[derive(Debug, Clone)]
+pub enum ModulePartKeyword {
+	Module(keyword::Module),
+	Call(keyword::Call),
+	Storage(keyword::Storage),
+	Event(keyword::Event),
+	Config(keyword::Config),
+	Origin(keyword::Origin),
+	Inherent(keyword::Inherent),
+	ValidateUnsigned(keyword::ValidateUnsigned),
 }
 
-impl Parse for ModuleEntry {
+impl Parse for ModulePartKeyword {
 	fn parse(input: ParseStream) -> Result<Self> {
 		let lookahead = input.lookahead1();
-		if lookahead.peek(Token![default]) {
-			Ok(ModuleEntry::Default(input.parse()?))
-		} else if lookahead.peek(Ident) {
-			Ok(ModuleEntry::Part(input.parse()?))
+
+		if lookahead.peek(keyword::Module) {
+			Ok(Self::Module(input.parse()?))
+		} else if lookahead.peek(keyword::Call) {
+			Ok(Self::Call(input.parse()?))
+		} else if lookahead.peek(keyword::Storage) {
+			Ok(Self::Storage(input.parse()?))
+		} else if lookahead.peek(keyword::Event) {
+			Ok(Self::Event(input.parse()?))
+		} else if lookahead.peek(keyword::Config) {
+			Ok(Self::Config(input.parse()?))
+		} else if lookahead.peek(keyword::Origin) {
+			Ok(Self::Origin(input.parse()?))
+		} else if lookahead.peek(keyword::Inherent) {
+			Ok(Self::Inherent(input.parse()?))
+		} else if lookahead.peek(keyword::ValidateUnsigned) {
+			Ok(Self::ValidateUnsigned(input.parse()?))
 		} else {
 			Err(lookahead.error())
 		}
 	}
 }
 
-impl ModuleEntry {
-	pub fn is_default(&self) -> bool {
+impl ModulePartKeyword {
+	/// Returns the name of `Self`.
+	fn name(&self) -> &'static str {
 		match self {
-			ModuleEntry::Default(_) => true,
-			_ => false,
+			Self::Module(_) => "Module",
+			Self::Call(_) => "Call",
+			Self::Storage(_) => "Storage",
+			Self::Event(_) => "Event",
+			Self::Config(_) => "Config",
+			Self::Origin(_) => "Origin",
+			Self::Inherent(_) => "Inherent",
+			Self::ValidateUnsigned(_) => "ValidateUnsigned",
+		}
+	}
+
+	/// Returns the name as `Ident`.
+	fn ident(&self) -> Ident {
+		Ident::new(self.name(), self.span())
+	}
+
+	/// Returns `true` if this module part allows to have an argument.
+	///
+	/// For example `Inherent(Timestamp)`.
+	fn allows_arg(&self) -> bool {
+		Self::all_allow_arg().iter().any(|n| *n == self.name())
+	}
+
+	/// Returns the names of all module parts that allow to have an argument.
+	fn all_allow_arg() -> &'static [&'static str] {
+		&["Inherent"]
+	}
+
+	/// Returns `true` if this module part is allowed to have generic arguments.
+	fn allows_generic(&self) -> bool {
+		Self::all_generic_arg().iter().any(|n| *n == self.name())
+	}
+
+	/// Returns the names of all module parts that allow to have a generic argument.
+	fn all_generic_arg() -> &'static [&'static str] {
+		&["Event", "Origin", "Config"]
+	}
+}
+
+impl Spanned for ModulePartKeyword {
+	fn span(&self) -> Span {
+		match self {
+			Self::Module(inner) => inner.span(),
+			Self::Call(inner) => inner.span(),
+			Self::Storage(inner) => inner.span(),
+			Self::Event(inner) => inner.span(),
+			Self::Config(inner) => inner.span(),
+			Self::Origin(inner) => inner.span(),
+			Self::Inherent(inner) => inner.span(),
+			Self::ValidateUnsigned(inner) => inner.span(),
 		}
 	}
 }
 
 #[derive(Debug, Clone)]
 pub struct ModulePart {
-	pub name: Ident,
+	pub keyword: ModulePartKeyword,
 	pub generics: syn::Generics,
 	pub args: Option<ext::Parens<ext::Punctuated<Ident, Token![,]>>>,
 }
 
 impl Parse for ModulePart {
 	fn parse(input: ParseStream) -> Result<Self> {
-		let name = input.parse()?;
+		let keyword: ModulePartKeyword = input.parse()?;
+
 		let generics: syn::Generics = input.parse()?;
-		if !generics.params.is_empty() && !Self::is_allowed_generic(&name) {
-			let valid_generics = ModulePart::format_names(ModulePart::allowed_generics());
+		if !generics.params.is_empty() && !keyword.allows_generic() {
+			let valid_generics = ModulePart::format_names(ModulePartKeyword::all_generic_arg());
 			let msg = format!(
 				"`{}` is not allowed to have generics. \
 				 Only the following modules are allowed to have generics: {}.",
-				name, valid_generics
+				keyword.name(),
+				valid_generics,
 			);
-			return Err(syn::Error::new(name.span(), msg));
+			return Err(syn::Error::new(keyword.span(), msg));
 		}
 		let args = if input.peek(token::Paren) {
-			if !Self::is_allowed_arg(&name) {
+			if !keyword.allows_arg() {
 				let syn::group::Parens { token: parens, .. } = syn::group::parse_parens(input)?;
-				let valid_names = ModulePart::format_names(ModulePart::allowed_args());
+				let valid_names = ModulePart::format_names(ModulePartKeyword::all_allow_arg());
 				let msg = format!(
 					"`{}` is not allowed to have arguments in parens. \
 					 Only the following modules are allowed to have arguments in parens: {}.",
-					name, valid_names
+					keyword.name(),
+					valid_names,
 				);
 				return Err(syn::Error::new(parens.span, msg));
 			}
@@ -313,8 +355,9 @@ impl Parse for ModulePart {
 		} else {
 			None
 		};
+
 		Ok(Self {
-			name,
+			keyword,
 			generics,
 			args,
 		})
@@ -322,65 +365,19 @@ impl Parse for ModulePart {
 }
 
 impl ModulePart {
-	pub fn is_allowed_generic(ident: &Ident) -> bool {
-		Self::allowed_generics().into_iter().any(|n| ident == n)
-	}
-
-	pub fn is_allowed_arg(ident: &Ident) -> bool {
-		Self::allowed_args().into_iter().any(|n| ident == n)
-	}
-
-	pub fn allowed_generics() -> Vec<&'static str> {
-		vec!["Event", "Origin", "Config"]
-	}
-
-	pub fn allowed_args() -> Vec<&'static str> {
-		vec!["Inherent"]
-	}
-
-	pub fn format_names(names: Vec<&'static str>) -> String {
+	pub fn format_names(names: &[&'static str]) -> String {
 		let res: Vec<_> = names.into_iter().map(|s| format!("`{}`", s)).collect();
 		res.join(", ")
 	}
 
-	pub fn is_included_in_default(&self) -> bool {
-		["Module", "Call", "Storage", "Event", "Config"]
-			.into_iter()
-			.any(|name| self.name == name)
+	/// The name of this module part.
+	pub fn name(&self) -> &'static str {
+		self.keyword.name()
 	}
 
-	/// Plain module name like `Event` or `Call`, etc.
-	pub fn with_name(name: &str, span: Span) -> Self {
-		let name = Ident::new(name, span);
-		Self {
-			name,
-			generics: syn::Generics {
-				lt_token: None,
-				gt_token: None,
-				where_clause: None,
-				..Default::default()
-			},
-			args: None,
-		}
-	}
-
-	/// Module name with generic like `Event<T>` or `Call<T>`, etc.
-	pub fn with_generics(name: &str, span: Span) -> Self {
-		let name = Ident::new(name, span);
-		let typ = Ident::new("T", span);
-		let generic_param = syn::GenericParam::Type(typ.into());
-		let generic_params = vec![generic_param].into_iter().collect();
-		let generics = syn::Generics {
-			lt_token: Some(syn::token::Lt { spans: [span] }),
-			params: generic_params,
-			gt_token: Some(syn::token::Gt { spans: [span] }),
-			where_clause: None,
-		};
-		Self {
-			name,
-			generics,
-			args: None,
-		}
+	/// The name of this module part as `Ident`.
+	pub fn ident(&self) -> Ident {
+		self.keyword.ident()
 	}
 }
 

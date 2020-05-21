@@ -1,35 +1,37 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+// This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Substrate is distributed in the hope that it will be useful,
+// This program is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use super::*;
 use assert_matches::assert_matches;
-use test_client::{
+use substrate_test_runtime_client::{
 	prelude::*,
-	consensus::BlockOrigin,
+	sp_consensus::BlockOrigin,
 	runtime::{H256, Block, Header},
 };
-use rpc_primitives::list::ListOrValue;
+use sp_rpc::list::ListOrValue;
+use sc_block_builder::BlockBuilderProvider;
+use futures::{executor, compat::{Future01CompatExt, Stream01CompatExt}};
+use crate::testing::TaskExecutor;
 
 #[test]
 fn should_return_header() {
-	let core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
-
-	let client = Arc::new(test_client::new());
-	let api = new_full(client.clone(), Subscriptions::new(Arc::new(remote)));
+	let client = Arc::new(substrate_test_runtime_client::new());
+	let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
 
 	assert_matches!(
 		api.header(Some(client.genesis_hash()).into()).wait(),
@@ -37,7 +39,8 @@ fn should_return_header() {
 			parent_hash: H256::from_low_u64_be(0),
 			number: 0,
 			state_root: x.state_root.clone(),
-			extrinsics_root: "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
+			extrinsics_root:
+				"03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
 			digest: Default::default(),
 		}
 	);
@@ -48,26 +51,21 @@ fn should_return_header() {
 			parent_hash: H256::from_low_u64_be(0),
 			number: 0,
 			state_root: x.state_root.clone(),
-			extrinsics_root: "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
+			extrinsics_root:
+				"03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
 			digest: Default::default(),
 		}
 	);
 
-	assert_matches!(
-		api.header(Some(H256::from_low_u64_be(5)).into()).wait(),
-		Ok(None)
-	);
+	assert_matches!(api.header(Some(H256::from_low_u64_be(5)).into()).wait(), Ok(None));
 }
 
 #[test]
 fn should_return_a_block() {
-	let core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
+	let mut client = Arc::new(substrate_test_runtime_client::new());
+	let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
 
-	let client = Arc::new(test_client::new());
-	let api = new_full(client.clone(), Subscriptions::new(Arc::new(remote)));
-
-	let block = client.new_block(Default::default()).unwrap().bake().unwrap();
+	let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
 	let block_hash = block.hash();
 	client.import(BlockOrigin::Own, block).unwrap();
 
@@ -84,7 +82,8 @@ fn should_return_a_block() {
 				parent_hash: client.genesis_hash(),
 				number: 1,
 				state_root: x.block.header.state_root.clone(),
-				extrinsics_root: "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
+				extrinsics_root:
+					"03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
 				digest: Default::default(),
 			},
 			extrinsics: vec![],
@@ -98,7 +97,8 @@ fn should_return_a_block() {
 				parent_hash: client.genesis_hash(),
 				number: 1,
 				state_root: x.block.header.state_root.clone(),
-				extrinsics_root: "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
+				extrinsics_root:
+					"03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314".parse().unwrap(),
 				digest: Default::default(),
 			},
 			extrinsics: vec![],
@@ -113,11 +113,8 @@ fn should_return_a_block() {
 
 #[test]
 fn should_return_block_hash() {
-	let core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
-
-	let client = Arc::new(test_client::new());
-	let api = new_full(client.clone(), Subscriptions::new(Arc::new(remote)));
+	let mut client = Arc::new(substrate_test_runtime_client::new());
+	let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
 
 	assert_matches!(
 		api.block_hash(None.into()),
@@ -135,7 +132,7 @@ fn should_return_block_hash() {
 		Ok(ListOrValue::Value(None))
 	);
 
-	let block = client.new_block(Default::default()).unwrap().bake().unwrap();
+	let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
 	client.import(BlockOrigin::Own, block.clone()).unwrap();
 
 	assert_matches!(
@@ -147,7 +144,7 @@ fn should_return_block_hash() {
 		Ok(ListOrValue::Value(Some(ref x))) if x == &block.hash()
 	);
 	assert_matches!(
-		api.block_hash(Some(ListOrValue::Value(primitives::U256::from(1u64).into())).into()),
+		api.block_hash(Some(ListOrValue::Value(sp_core::U256::from(1u64).into())).into()),
 		Ok(ListOrValue::Value(Some(ref x))) if x == &block.hash()
 	);
 
@@ -160,11 +157,8 @@ fn should_return_block_hash() {
 
 #[test]
 fn should_return_finalized_hash() {
-	let core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
-
-	let client = Arc::new(test_client::new());
-	let api = new_full(client.clone(), Subscriptions::new(Arc::new(remote)));
+	let mut client = Arc::new(substrate_test_runtime_client::new());
+	let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
 
 	assert_matches!(
 		api.finalized_head(),
@@ -172,8 +166,8 @@ fn should_return_finalized_hash() {
 	);
 
 	// import new block
-	let builder = client.new_block(Default::default()).unwrap();
-	client.import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
+	let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
+	client.import(BlockOrigin::Own, block).unwrap();
 	// no finalization yet
 	assert_matches!(
 		api.finalized_head(),
@@ -190,59 +184,82 @@ fn should_return_finalized_hash() {
 
 #[test]
 fn should_notify_about_latest_block() {
-	let mut core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
 	let (subscriber, id, transport) = Subscriber::new_test("test");
 
 	{
-		let client = Arc::new(test_client::new());
-		let api = new_full(client.clone(), Subscriptions::new(Arc::new(remote)));
+		let mut client = Arc::new(substrate_test_runtime_client::new());
+		let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
+
+		api.subscribe_all_heads(Default::default(), subscriber);
+
+		// assert id assigned
+		assert_eq!(executor::block_on(id.compat()), Ok(Ok(SubscriptionId::Number(1))));
+
+		let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
+		client.import(BlockOrigin::Own, block).unwrap();
+	}
+
+	// assert initial head sent.
+	let (notification, next) = executor::block_on(transport.into_future().compat()).unwrap();
+	assert!(notification.is_some());
+	// assert notification sent to transport
+	let (notification, next) = executor::block_on(next.into_future().compat()).unwrap();
+	assert!(notification.is_some());
+	// no more notifications on this channel
+	assert_eq!(executor::block_on(next.into_future().compat()).unwrap().0, None);
+}
+
+#[test]
+fn should_notify_about_best_block() {
+	let (subscriber, id, transport) = Subscriber::new_test("test");
+
+	{
+		let mut client = Arc::new(substrate_test_runtime_client::new());
+		let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
 
 		api.subscribe_new_heads(Default::default(), subscriber);
 
 		// assert id assigned
-		assert_eq!(core.block_on(id), Ok(Ok(SubscriptionId::Number(1))));
+		assert_eq!(executor::block_on(id.compat()), Ok(Ok(SubscriptionId::Number(1))));
 
-		let builder = client.new_block(Default::default()).unwrap();
-		client.import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
+		let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
+		client.import(BlockOrigin::Own, block).unwrap();
 	}
 
 	// assert initial head sent.
-	let (notification, next) = core.block_on(transport.into_future()).unwrap();
+	let (notification, next) = executor::block_on(transport.into_future().compat()).unwrap();
 	assert!(notification.is_some());
 	// assert notification sent to transport
-	let (notification, next) = core.block_on(next.into_future()).unwrap();
+	let (notification, next) = executor::block_on(next.into_future().compat()).unwrap();
 	assert!(notification.is_some());
 	// no more notifications on this channel
-	assert_eq!(core.block_on(next.into_future()).unwrap().0, None);
+	assert_eq!(executor::block_on(Stream01CompatExt::compat(next).into_future()).0, None);
 }
 
 #[test]
 fn should_notify_about_finalized_block() {
-	let mut core = ::tokio::runtime::Runtime::new().unwrap();
-	let remote = core.executor();
 	let (subscriber, id, transport) = Subscriber::new_test("test");
 
 	{
-		let client = Arc::new(test_client::new());
-		let api = new_full(client.clone(), Subscriptions::new(Arc::new(remote)));
+		let mut client = Arc::new(substrate_test_runtime_client::new());
+		let api = new_full(client.clone(), Subscriptions::new(Arc::new(TaskExecutor)));
 
 		api.subscribe_finalized_heads(Default::default(), subscriber);
 
 		// assert id assigned
-		assert_eq!(core.block_on(id), Ok(Ok(SubscriptionId::Number(1))));
+		assert_eq!(executor::block_on(id.compat()), Ok(Ok(SubscriptionId::Number(1))));
 
-		let builder = client.new_block(Default::default()).unwrap();
-		client.import(BlockOrigin::Own, builder.bake().unwrap()).unwrap();
+		let block = client.new_block(Default::default()).unwrap().build().unwrap().block;
+		client.import(BlockOrigin::Own, block).unwrap();
 		client.finalize_block(BlockId::number(1), None).unwrap();
 	}
 
 	// assert initial head sent.
-	let (notification, next) = core.block_on(transport.into_future()).unwrap();
+	let (notification, next) = executor::block_on(transport.into_future().compat()).unwrap();
 	assert!(notification.is_some());
 	// assert notification sent to transport
-	let (notification, next) = core.block_on(next.into_future()).unwrap();
+	let (notification, next) = executor::block_on(next.into_future().compat()).unwrap();
 	assert!(notification.is_some());
 	// no more notifications on this channel
-	assert_eq!(core.block_on(next.into_future()).unwrap().0, None);
+	assert_eq!(executor::block_on(next.into_future().compat()).unwrap().0, None);
 }

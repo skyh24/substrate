@@ -1,4 +1,4 @@
-// Copyright 2018-2019 Parity Technologies (UK) Ltd.
+// Copyright 2018-2020 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
 // Substrate is free software: you can redistribute it and/or modify
@@ -21,14 +21,14 @@ use super::{
 	TrieIdGenerator,
 };
 use crate::exec::StorageKey;
-use rstd::cell::RefCell;
-use rstd::collections::btree_map::{BTreeMap, Entry};
-use rstd::prelude::*;
-use runtime_io::hashing::blake2_256;
-use sr_primitives::traits::{Bounded, Zero};
-use support::traits::{Currency, Get, Imbalance, SignedImbalance, UpdateBalanceOutcome};
-use support::{storage::child, StorageMap};
-use system;
+use sp_std::cell::RefCell;
+use sp_std::collections::btree_map::{BTreeMap, Entry};
+use sp_std::prelude::*;
+use sp_io::hashing::blake2_256;
+use sp_runtime::traits::{Bounded, Zero};
+use frame_support::traits::{Currency, Get, Imbalance, SignedImbalance};
+use frame_support::{storage::child, StorageMap};
+use frame_system;
 
 // Note: we don't provide Option<Contract> because we can't create
 // the trie_id in the overlay, thus we provide an overlay on the fields
@@ -100,7 +100,7 @@ impl<T: Trait> Default for ChangeEntry<T> {
 	}
 }
 
-pub type ChangeSet<T> = BTreeMap<<T as system::Trait>::AccountId, ChangeEntry<T>>;
+pub type ChangeSet<T> = BTreeMap<<T as frame_system::Trait>::AccountId, ChangeEntry<T>>;
 
 pub trait AccountDb<T: Trait> {
 	/// Account is used when overlayed otherwise trie_id must be provided.
@@ -128,7 +128,7 @@ impl<T: Trait> AccountDb<T> for DirectAccountDb {
 		trie_id: Option<&TrieId>,
 		location: &StorageKey
 	) -> Option<Vec<u8>> {
-		trie_id.and_then(|id| child::get_raw(id, &blake2_256(location)))
+		trie_id.and_then(|id| child::get_raw(&crate::child_trie_info(&id[..]), &blake2_256(location)))
 	}
 	fn get_code_hash(&self, account: &T::AccountId) -> Option<CodeHash<T>> {
 		<ContractInfoOf<T>>::get(account).and_then(|i| i.as_alive().map(|i| i.code_hash))
@@ -137,7 +137,7 @@ impl<T: Trait> AccountDb<T> for DirectAccountDb {
 		<ContractInfoOf<T>>::get(account).and_then(|i| i.as_alive().map(|i| i.rent_allowance))
 	}
 	fn contract_exists(&self, account: &T::AccountId) -> bool {
-		<ContractInfoOf<T>>::exists(account)
+		<ContractInfoOf<T>>::contains_key(account)
 	}
 	fn get_balance(&self, account: &T::AccountId) -> BalanceOf<T> {
 		T::Currency::free_balance(account)
@@ -146,14 +146,8 @@ impl<T: Trait> AccountDb<T> for DirectAccountDb {
 		let mut total_imbalance = SignedImbalance::zero();
 		for (address, changed) in s.into_iter() {
 			if let Some(balance) = changed.balance() {
-				let (imbalance, outcome) = T::Currency::make_free_balance_be(&address, balance);
+				let imbalance = T::Currency::make_free_balance_be(&address, balance);
 				total_imbalance = total_imbalance.merge(imbalance);
-				if let UpdateBalanceOutcome::AccountKilled = outcome {
-					// Account killed. This will ultimately lead to calling `OnFreeBalanceZero` callback
-					// which will make removal of CodeHashOf and AccountStorage for this account.
-					// In order to avoid writing over the deleted properties we `continue` here.
-					continue;
-				}
 			}
 
 			if changed.code_hash().is_some()
@@ -173,18 +167,18 @@ impl<T: Trait> AccountDb<T> for DirectAccountDb {
 					(false, Some(info), _) => info,
 					// Existing contract is being removed.
 					(true, Some(info), None) => {
-						child::kill_storage(&info.trie_id);
+						child::kill_storage(&info.child_trie_info());
 						<ContractInfoOf<T>>::remove(&address);
 						continue;
 					}
 					// Existing contract is being replaced by a new one.
 					(true, Some(info), Some(code_hash)) => {
-						child::kill_storage(&info.trie_id);
+						child::kill_storage(&info.child_trie_info());
 						AliveContractInfo::<T> {
 							code_hash,
 							storage_size: T::StorageSizeOffset::get(),
 							trie_id: <T as Trait>::TrieIdGenerator::trie_id(&address),
-							deduct_block: <system::Module<T>>::block_number(),
+							deduct_block: <frame_system::Module<T>>::block_number(),
 							rent_allowance: <BalanceOf<T>>::max_value(),
 							last_write: None,
 						}
@@ -195,7 +189,7 @@ impl<T: Trait> AccountDb<T> for DirectAccountDb {
 							code_hash,
 							storage_size: T::StorageSizeOffset::get(),
 							trie_id: <T as Trait>::TrieIdGenerator::trie_id(&address),
-							deduct_block: <system::Module<T>>::block_number(),
+							deduct_block: <frame_system::Module<T>>::block_number(),
 							rent_allowance: <BalanceOf<T>>::max_value(),
 							last_write: None,
 						}
@@ -213,18 +207,21 @@ impl<T: Trait> AccountDb<T> for DirectAccountDb {
 				}
 
 				if !changed.storage.is_empty() {
-					new_info.last_write = Some(<system::Module<T>>::block_number());
+					new_info.last_write = Some(<frame_system::Module<T>>::block_number());
 				}
 
 				for (k, v) in changed.storage.into_iter() {
-					if let Some(value) = child::get_raw(&new_info.trie_id[..], &blake2_256(&k)) {
+					if let Some(value) = child::get_raw(
+						&new_info.child_trie_info(),
+						&blake2_256(&k),
+					) {
 						new_info.storage_size -= value.len() as u32;
 					}
 					if let Some(value) = v {
 						new_info.storage_size += value.len() as u32;
-						child::put_raw(&new_info.trie_id[..], &blake2_256(&k), &value[..]);
+						child::put_raw(&new_info.child_trie_info(), &blake2_256(&k), &value[..]);
 					} else {
-						child::kill(&new_info.trie_id[..], &blake2_256(&k));
+						child::kill(&new_info.child_trie_info(), &blake2_256(&k));
 					}
 				}
 

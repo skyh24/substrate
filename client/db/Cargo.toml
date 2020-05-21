@@ -1,35 +1,48 @@
 [package]
-name = "substrate-client-db"
-version = "2.0.0"
+name = "sc-client-db"
+version = "0.8.0-dev"
 authors = ["Parity Technologies <admin@parity.io>"]
 edition = "2018"
+license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
+homepage = "https://substrate.dev"
+repository = "https://github.com/paritytech/substrate/"
+description = "Client backend that uses RocksDB database as storage."
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-parking_lot = "0.9.0"
+parking_lot = "0.10.0"
 log = "0.4.8"
-kvdb = { git = "https://github.com/paritytech/parity-common", rev="03a2ba08f47f4af4219280e660a1ea92cb8896bd" }
-# FIXME replace with release as soon as our rocksdb changes are released upstream https://github.com/paritytech/parity-common/issues/88
-kvdb-rocksdb = { git = "https://github.com/paritytech/parity-common", rev="03a2ba08f47f4af4219280e660a1ea92cb8896bd", optional = true }
-kvdb-memorydb = { git = "https://github.com/paritytech/parity-common", rev="03a2ba08f47f4af4219280e660a1ea92cb8896bd" }
+kvdb = "0.6.0"
+kvdb-rocksdb = { version = "0.8", optional = true }
+kvdb-memorydb = "0.6.0"
 linked-hash-map = "0.5.2"
 hash-db = "0.15.2"
-client-api = { package = "substrate-client-api", path = "../api" }
-primitives = { package = "substrate-primitives", path = "../../primitives/core" }
-sr-primitives = {  path = "../../primitives/sr-primitives" }
-client = { package = "substrate-client", path = "../" }
-state-machine = { package = "substrate-state-machine", path = "../../primitives/state-machine" }
-codec = { package = "parity-scale-codec", version = "1.0.0", features = ["derive"] }
-executor = { package = "substrate-executor", path = "../executor" }
-state_db = { package = "substrate-state-db", path = "../state-db" }
-trie = { package = "substrate-trie", path = "../../primitives/trie" }
-consensus_common = { package = "substrate-consensus-common", path = "../../primitives/consensus/common" }
-sp-blockchain = { path = "../../primitives/blockchain" }
+parity-util-mem = { version = "0.6.1", default-features = false, features = ["std"] }
+codec = { package = "parity-scale-codec", version = "1.3.0", features = ["derive"] }
+blake2-rfc = "0.2.18"
+
+sc-client-api = { version = "2.0.0-dev", path = "../api" }
+sp-core = { version = "2.0.0-dev", path = "../../primitives/core" }
+sp-runtime = { version = "2.0.0-dev", path = "../../primitives/runtime" }
+sp-state-machine = { version = "0.8.0-dev", path = "../../primitives/state-machine" }
+sc-executor = { version = "0.8.0-dev", path = "../executor" }
+sc-state-db = { version = "0.8.0-dev", path = "../state-db" }
+sp-trie = { version = "2.0.0-dev", path = "../../primitives/trie" }
+sp-consensus = { version = "0.8.0-dev", path = "../../primitives/consensus/common" }
+sp-blockchain = { version = "2.0.0-dev", path = "../../primitives/blockchain" }
+sp-database = { version = "2.0.0-dev", path = "../../primitives/database" }
+parity-db = { version = "0.1.2", optional = true }
+prometheus-endpoint = { package = "substrate-prometheus-endpoint", version = "0.8.0-dev", path = "../../utils/prometheus" }
 
 [dev-dependencies]
-substrate-keyring = { path = "../../primitives/keyring" }
-test-client = { package = "substrate-test-runtime-client", path = "../../test/utils/runtime/client" }
+sp-keyring = { version = "2.0.0-dev", path = "../../primitives/keyring" }
+substrate-test-runtime-client = { version = "2.0.0-dev", path = "../../test-utils/runtime/client" }
 env_logger = "0.7.0"
-quickcheck = "0.8"
+quickcheck = "0.9"
+kvdb-rocksdb = "0.8"
+tempfile = "3"
 
 [features]
 default = []

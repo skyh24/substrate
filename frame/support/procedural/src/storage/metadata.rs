@@ -1,18 +1,19 @@
-// Copyright 2017-2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2017-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Implementation of `storage_metadata` on module structure, used by construct_runtime.
 
@@ -41,20 +42,7 @@ fn storage_line_metadata_type(scrate: &TokenStream, line: &StorageLineDefExt) ->
 					hasher: #scrate::metadata::#hasher,
 					key: #scrate::metadata::DecodeDifferent::Encode(#key),
 					value: #scrate::metadata::DecodeDifferent::Encode(#value_type),
-					is_linked: false,
-				}
-			}
-		},
-		StorageLineTypeDef::LinkedMap(map) => {
-			let hasher = map.hasher.into_metadata();
-			let key = &map.key;
-			let key = clean_type_string(&quote!(#key).to_string());
-			quote!{
-				#scrate::metadata::StorageEntryType::Map {
-					hasher: #scrate::metadata::#hasher,
-					key: #scrate::metadata::DecodeDifferent::Encode(#key),
-					value: #scrate::metadata::DecodeDifferent::Encode(#value_type),
-					is_linked: true,
+					unused: false,
 				}
 			}
 		},
@@ -104,11 +92,11 @@ fn default_byte_getter(
 		#[doc(hidden)]
 		pub struct #struct_name<
 			#runtime_generic, #optional_instance_bound_optional_default
-		>(pub #scrate::rstd::marker::PhantomData<(#runtime_generic #optional_comma_instance)>);
+		>(pub #scrate::sp_std::marker::PhantomData<(#runtime_generic #optional_comma_instance)>);
 
 		#[cfg(feature = "std")]
 		#[allow(non_upper_case_globals)]
-		static #cache_name: #scrate::once_cell::sync::OnceCell<#scrate::rstd::vec::Vec<u8>> =
+		static #cache_name: #scrate::once_cell::sync::OnceCell<#scrate::sp_std::vec::Vec<u8>> =
 			#scrate::once_cell::sync::OnceCell::new();
 
 		#[cfg(feature = "std")]
@@ -117,7 +105,7 @@ fn default_byte_getter(
 			for #struct_name<#runtime_generic, #optional_instance>
 			#where_clause
 		{
-			fn default_byte(&self) -> #scrate::rstd::vec::Vec<u8> {
+			fn default_byte(&self) -> #scrate::sp_std::vec::Vec<u8> {
 				use #scrate::codec::Encode;
 				#cache_name.get_or_init(|| {
 					let def_val: #query_type = #default;
@@ -138,7 +126,7 @@ fn default_byte_getter(
 			for #struct_name<#runtime_generic, #optional_instance>
 			#where_clause
 		{
-			fn default_byte(&self) -> #scrate::rstd::vec::Vec<u8> {
+			fn default_byte(&self) -> #scrate::sp_std::vec::Vec<u8> {
 				use #scrate::codec::Encode;
 				let def_val: #query_type = #default;
 				<#query_type as Encode>::encode(&def_val)
@@ -146,7 +134,7 @@ fn default_byte_getter(
 		}
 	};
 	let struct_instance = quote!(
-		#struct_name::<#runtime_generic, #optional_instance>(#scrate::rstd::marker::PhantomData)
+		#struct_name::<#runtime_generic, #optional_instance>(#scrate::sp_std::marker::PhantomData)
 	);
 
 	(struct_def, struct_instance)

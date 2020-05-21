@@ -1,18 +1,19 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! # Scored Pool Module
 //!
@@ -53,15 +54,16 @@
 //! ## Usage
 //!
 //! ```
-//! use support::{decl_module, dispatch::Result};
-//! use system::ensure_signed;
+//! use frame_support::{decl_module, dispatch};
+//! use frame_system::{self as system, ensure_signed};
 //! use pallet_scored_pool::{self as scored_pool};
 //!
 //! pub trait Trait: scored_pool::Trait {}
 //!
 //! decl_module! {
 //! 	pub struct Module<T: Trait> for enum Call where origin: T::Origin {
-//! 		pub fn candidate(origin) -> Result {
+//! 		#[weight = 0]
+//! 		pub fn candidate(origin) -> dispatch::DispatchResult {
 //! 			let who = ensure_signed(origin)?;
 //!
 //! 			let _ = <scored_pool::Module<T>>::submit_candidacy(
@@ -89,21 +91,20 @@ mod mock;
 mod tests;
 
 use codec::FullCodec;
-use rstd::{
+use sp_std::{
 	fmt::Debug,
 	prelude::*,
 };
-use support::{
-	decl_module, decl_storage, decl_event, ensure,
-	traits::{ChangeMembers, InitializeMembers, Currency, Get, ReservableCurrency},
+use frame_support::{
+	decl_module, decl_storage, decl_event, ensure, decl_error,
+	traits::{EnsureOrigin, ChangeMembers, InitializeMembers, Currency, Get, ReservableCurrency},
+	weights::Weight,
 };
-use system::{self, ensure_root, ensure_signed};
-use sr_primitives::{
-	traits::{EnsureOrigin, SimpleArithmetic, MaybeSerializeDeserialize, Zero, StaticLookup},
-};
+use frame_system::{self as system, ensure_root, ensure_signed};
+use sp_runtime::traits::{AtLeast32Bit, MaybeSerializeDeserialize, Zero, StaticLookup};
 
-type BalanceOf<T, I> = <<T as Trait<I>>::Currency as Currency<<T as system::Trait>::AccountId>>::Balance;
-type PoolT<T, I> = Vec<(<T as system::Trait>::AccountId, Option<<T as Trait<I>>::Score>)>;
+type BalanceOf<T, I> = <<T as Trait<I>>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
+type PoolT<T, I> = Vec<(<T as frame_system::Trait>::AccountId, Option<<T as Trait<I>>::Score>)>;
 
 /// The enum is supplied when refreshing the members set.
 /// Depending on the enum variant the corresponding associated
@@ -115,16 +116,16 @@ enum ChangeReceiver {
 	MembershipChanged,
 }
 
-pub trait Trait<I=DefaultInstance>: system::Trait {
+pub trait Trait<I=DefaultInstance>: frame_system::Trait {
 	/// The currency used for deposits.
 	type Currency: Currency<Self::AccountId> + ReservableCurrency<Self::AccountId>;
 
 	/// The score attributed to a member or candidate.
 	type Score:
-		SimpleArithmetic + Clone + Copy + Default + FullCodec + MaybeSerializeDeserialize + Debug;
+		AtLeast32Bit + Clone + Copy + Default + FullCodec + MaybeSerializeDeserialize + Debug;
 
 	/// The overarching event type.
-	type Event: From<Event<Self, I>> + Into<<Self as system::Trait>::Event>;
+	type Event: From<Event<Self, I>> + Into<<Self as frame_system::Trait>::Event>;
 
 	// The deposit which is reserved from candidates if they want to
 	// start a candidacy. The deposit gets returned when the candidacy is
@@ -165,7 +166,7 @@ decl_storage! {
 		/// check if a candidate is already in the pool, without having to
 		/// iterate over the entire pool (the `Pool` is not sorted by
 		/// `T::AccountId`, but by `T::Score` instead).
-		CandidateExists get(fn candidate_exists): map T::AccountId => bool;
+		CandidateExists get(fn candidate_exists): map hasher(twox_64_concat) T::AccountId => bool;
 
 		/// The current membership, stored as an ordered Vec.
 		Members get(fn members): Vec<T::AccountId>;
@@ -175,7 +176,7 @@ decl_storage! {
 	}
 	add_extra_genesis {
 		config(members): Vec<T::AccountId>;
-		config(phantom): rstd::marker::PhantomData<I>;
+		config(phantom): sp_std::marker::PhantomData<I>;
 		build(|config| {
 			let mut pool = config.pool.clone();
 
@@ -189,8 +190,8 @@ decl_storage! {
 					<CandidateExists<T, I>>::insert(who, true);
 				});
 
-			/// Sorts the `Pool` by score in a descending order. Entities which
-			/// have a score of `None` are sorted to the beginning of the vec.
+			// Sorts the `Pool` by score in a descending order. Entities which
+			// have a score of `None` are sorted to the beginning of the vec.
 			pool.sort_by_key(|(_, maybe_score)|
 				Reverse(maybe_score.unwrap_or_default())
 			);
@@ -203,7 +204,7 @@ decl_storage! {
 
 decl_event!(
 	pub enum Event<T, I=DefaultInstance> where
-		<T as system::Trait>::AccountId,
+		<T as frame_system::Trait>::AccountId,
 	{
 		/// The given member was removed. See the transaction for who.
 		MemberRemoved,
@@ -218,24 +219,39 @@ decl_event!(
 		/// See the transaction for who.
 		CandidateScored,
 		/// Phantom member, never used.
-		Dummy(rstd::marker::PhantomData<(AccountId, I)>),
+		Dummy(sp_std::marker::PhantomData<(AccountId, I)>),
 	}
 );
+
+decl_error! {
+	/// Error for the scored-pool module.
+	pub enum Error for Module<T: Trait<I>, I: Instance> {
+		/// Already a member.
+		AlreadyInPool,
+		/// Index out of bounds.
+		InvalidIndex,
+		/// Index does not match requested account.
+		WrongAccountIndex,
+	}
+}
 
 decl_module! {
 	pub struct Module<T: Trait<I>, I: Instance=DefaultInstance>
 		for enum Call
 		where origin: T::Origin
 	{
+		type Error = Error<T, I>;
+
 		fn deposit_event() = default;
 
 		/// Every `Period` blocks the `Members` set is refreshed from the
 		/// highest scoring members in the pool.
-		fn on_initialize(n: T::BlockNumber) {
+		fn on_initialize(n: T::BlockNumber) -> Weight {
 			if n % T::Period::get() == Zero::zero() {
 				let pool = <Pool<T, I>>::get();
 				<Module<T, I>>::refresh_members(pool, ChangeReceiver::MembershipChanged);
 			}
+			0
 		}
 
 		/// Add `origin` to the pool of candidates.
@@ -249,20 +265,17 @@ decl_module! {
 		///
 		/// The `index` parameter of this function must be set to
 		/// the index of the transactor in the `Pool`.
+		#[weight = 0]
 		pub fn submit_candidacy(origin) {
 			let who = ensure_signed(origin)?;
-			ensure!(!<CandidateExists<T, I>>::exists(&who), "already a member");
+			ensure!(!<CandidateExists<T, I>>::contains_key(&who), Error::<T, I>::AlreadyInPool);
 
 			let deposit = T::CandidateDeposit::get();
-			T::Currency::reserve(&who, deposit)
-				.map_err(|_| "balance too low to submit candidacy")?;
+			T::Currency::reserve(&who, deposit)?;
 
 			// can be inserted as last element in pool, since entities with
 			// `None` are always sorted to the end.
-			if let Err(e) = <Pool<T, I>>::append(&[(who.clone(), None)]) {
-				T::Currency::unreserve(&who, deposit);
-				return Err(e);
-			}
+			<Pool<T, I>>::append((who.clone(), Option::<<T as Trait<I>>::Score>::None));
 
 			<CandidateExists<T, I>>::insert(&who, true);
 
@@ -279,6 +292,7 @@ decl_module! {
 		///
 		/// The `index` parameter of this function must be set to
 		/// the index of the transactor in the `Pool`.
+		#[weight = 0]
 		pub fn withdraw_candidacy(
 			origin,
 			index: u32
@@ -298,6 +312,7 @@ decl_module! {
 		///
 		/// The `index` parameter of this function must be set to
 		/// the index of `dest` in the `Pool`.
+		#[weight = 0]
 		pub fn kick(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
@@ -305,8 +320,7 @@ decl_module! {
 		) {
 			T::KickOrigin::try_origin(origin)
 				.map(|_| ())
-				.or_else(ensure_root)
-				.map_err(|_| "bad origin")?;
+				.or_else(ensure_root)?;
 
 			let who = T::Lookup::lookup(dest)?;
 
@@ -323,6 +337,7 @@ decl_module! {
 		///
 		/// The `index` parameter of this function must be set to
 		/// the index of the `dest` in the `Pool`.
+		#[weight = 0]
 		pub fn score(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
@@ -331,8 +346,7 @@ decl_module! {
 		) {
 			T::ScoreOrigin::try_origin(origin)
 				.map(|_| ())
-				.or_else(ensure_root)
-				.map_err(|_| "bad origin")?;
+				.or_else(ensure_root)?;
 
 			let who = T::Lookup::lookup(dest)?;
 
@@ -364,6 +378,7 @@ decl_module! {
 		/// (this happens each `Period`).
 		///
 		/// May only be called from root.
+		#[weight = 0]
 		pub fn change_member_count(origin, count: u32) {
 			ensure_root(origin)?;
 			<MemberCount<I>>::put(&count);
@@ -414,7 +429,7 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 		mut pool: PoolT<T, I>,
 		remove: T::AccountId,
 		index: u32
-	) -> Result<(), &'static str> {
+	) -> Result<(), Error<T, I>> {
 		// all callers of this function in this module also check
 		// the index for validity before calling this function.
 		// nevertheless we check again here, to assert that there was
@@ -444,13 +459,12 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 		pool: &PoolT<T, I>,
 		who: &T::AccountId,
 		index: u32
-	) -> Result<(), &'static str> {
-		ensure!(index < pool.len() as u32, "index out of bounds");
+	) -> Result<(), Error<T, I>> {
+		ensure!(index < pool.len() as u32, Error::<T, I>::InvalidIndex);
 
 		let (index_who, _index_score) = &pool[index as usize];
-		ensure!(index_who == who, "index does not match requested account");
+		ensure!(index_who == who, Error::<T, I>::WrongAccountIndex);
 
 		Ok(())
 	}
 }
-

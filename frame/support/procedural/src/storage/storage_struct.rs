@@ -1,26 +1,27 @@
-// Copyright 2019 Parity Technologies (UK) Ltd.
 // This file is part of Substrate.
 
-// Substrate is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
+// Copyright (C) 2019-2020 Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
 
-// Substrate is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-
-// You should have received a copy of the GNU General Public License
-// along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Implementation of storage structures and implementation of storage traits on them.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{TokenStream, Ident, Span};
 use quote::quote;
 use super::{
 	DeclStorageDefExt, StorageLineTypeDef,
-	instance_trait::{PREFIX_FOR, HEAD_KEY_FOR},
+	instance_trait::INHERENT_INSTANCE_NAME,
 };
 
 fn from_optional_value_to_query(is_option: bool, default: &Option<syn::Expr>) -> TokenStream {
@@ -68,7 +69,7 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 			#visibility struct #name<
 				#optional_storage_runtime_bound_comma #optional_instance_bound_optional_default
 			>(
-				#scrate::rstd::marker::PhantomData<
+				#scrate::sp_std::marker::PhantomData<
 					(#optional_storage_runtime_comma #optional_instance)
 				>
 			) #optional_storage_where_clause;
@@ -78,17 +79,17 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 		let from_optional_value_to_query =
 			from_optional_value_to_query(line.is_option, &line.default_value);
 
-		let final_prefix = if let Some(instance) = def.module_instance.as_ref() {
-			let instance = &instance.instance_generic;
-			let const_name = syn::Ident::new(
-				&format!("{}{}", PREFIX_FOR, line.name.to_string()), proc_macro2::Span::call_site()
-			);
-			quote!( #instance::#const_name.as_bytes() )
+		// Contains accessor to instance, used to get prefixes
+		let instance_or_inherent = if let Some(instance) = def.module_instance.as_ref() {
+			instance.instance_generic.clone()
 		} else {
-			let prefix = format!("{} {}", def.crate_name, line.name);
-			quote!( #prefix.as_bytes() )
+			Ident::new(INHERENT_INSTANCE_NAME, Span::call_site())
 		};
 
+		let storage_name_bstr = syn::LitByteStr::new(
+			line.name.to_string().as_ref(),
+			line.name.span()
+		);
 
 		let storage_generator_trait = &line.storage_generator_trait;
 		let storage_struct = &line.storage_struct;
@@ -104,8 +105,12 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 					{
 						type Query = #query_type;
 
-						fn unhashed_key() -> &'static [u8] {
-							#final_prefix
+						fn module_prefix() -> &'static [u8] {
+							#instance_or_inherent::PREFIX.as_bytes()
+						}
+
+						fn storage_prefix() -> &'static [u8] {
+							#storage_name_bstr
 						}
 
 						fn from_optional_value_to_query(v: Option<#value_type>) -> Self::Query {
@@ -121,14 +126,30 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 			StorageLineTypeDef::Map(map) => {
 				let hasher = map.hasher.to_storage_hasher_struct();
 				quote!(
+					impl<#impl_trait> #scrate::storage::StoragePrefixedMap<#value_type>
+						for #storage_struct #optional_storage_where_clause
+					{
+						fn module_prefix() -> &'static [u8] {
+							#instance_or_inherent::PREFIX.as_bytes()
+						}
+
+						fn storage_prefix() -> &'static [u8] {
+							#storage_name_bstr
+						}
+					}
+
 					impl<#impl_trait> #scrate::#storage_generator_trait for #storage_struct
 					#optional_storage_where_clause
 					{
 						type Query = #query_type;
 						type Hasher = #scrate::#hasher;
 
-						fn prefix() -> &'static [u8] {
-							#final_prefix
+						fn module_prefix() -> &'static [u8] {
+							#instance_or_inherent::PREFIX.as_bytes()
+						}
+
+						fn storage_prefix() -> &'static [u8] {
+							#storage_name_bstr
 						}
 
 						fn from_optional_value_to_query(v: Option<#value_type>) -> Self::Query {
@@ -137,51 +158,6 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 
 						fn from_query_to_optional_value(v: Self::Query) -> Option<#value_type> {
 							#from_query_to_optional_value
-						}
-					}
-				)
-			},
-			StorageLineTypeDef::LinkedMap(map) => {
-				let hasher = map.hasher.to_storage_hasher_struct();
-
-				// make sure to use different prefix for head and elements.
-				let head_key = if let Some(instance) = def.module_instance.as_ref() {
-					let instance = &instance.instance_generic;
-					let const_name = syn::Ident::new(
-						&format!("{}{}", HEAD_KEY_FOR, line.name.to_string()), proc_macro2::Span::call_site()
-					);
-					quote!( #instance::#const_name.as_bytes() )
-				} else {
-					let prefix = format!("head of {} {}", def.crate_name, line.name);
-					quote!( #prefix.as_bytes() )
-				};
-
-				quote!(
-					impl<#impl_trait> #scrate::#storage_generator_trait for #storage_struct
-					#optional_storage_where_clause
-					{
-						type Query = #query_type;
-						type Hasher = #scrate::#hasher;
-						type KeyFormat = Self;
-
-						fn prefix() -> &'static [u8] {
-							#final_prefix
-						}
-
-						fn from_optional_value_to_query(v: Option<#value_type>) -> Self::Query {
-							#from_optional_value_to_query
-						}
-
-						fn from_query_to_optional_value(v: Self::Query) -> Option<#value_type> {
-							#from_query_to_optional_value
-						}
-					}
-
-					impl<#impl_trait> #scrate::storage::generator::LinkedMapKeyFormat for #storage_struct {
-						type Hasher = #scrate::#hasher;
-
-						fn head_key() -> &'static [u8] {
-							#head_key
 						}
 					}
 				)
@@ -190,6 +166,18 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 				let hasher1 = map.hasher1.to_storage_hasher_struct();
 				let hasher2 = map.hasher2.to_storage_hasher_struct();
 				quote!(
+					impl<#impl_trait> #scrate::storage::StoragePrefixedMap<#value_type>
+						for #storage_struct #optional_storage_where_clause
+					{
+						fn module_prefix() -> &'static [u8] {
+							#instance_or_inherent::PREFIX.as_bytes()
+						}
+
+						fn storage_prefix() -> &'static [u8] {
+							#storage_name_bstr
+						}
+					}
+
 					impl<#impl_trait> #scrate::#storage_generator_trait for #storage_struct
 					#optional_storage_where_clause
 					{
@@ -199,8 +187,12 @@ pub fn decl_and_impl(scrate: &TokenStream, def: &DeclStorageDefExt) -> TokenStre
 
 						type Hasher2 = #scrate::#hasher2;
 
-						fn key1_prefix() -> &'static [u8] {
-							#final_prefix
+						fn module_prefix() -> &'static [u8] {
+							#instance_or_inherent::PREFIX.as_bytes()
+						}
+
+						fn storage_prefix() -> &'static [u8] {
+							#storage_name_bstr
 						}
 
 						fn from_optional_value_to_query(v: Option<#value_type>) -> Self::Query {
